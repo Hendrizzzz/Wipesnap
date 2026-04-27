@@ -6,6 +6,8 @@ vault.json
 vault.meta.json
 vault.state.json
 Apps/
+BrowserProfile/
+run-diagnostics.json
 .DS_Store
 .env
 _planning/
@@ -17,13 +19,6 @@ diff.txt
 .gemini/
 electron.vite.config.*.mjs
 
-WIPESNAP*.md
-WIPESNAP_*.md
-# Legacy ignored report names from before the Wipesnap rename.
-OMNILAUNCH*.md
-QUICKPASS*.md
-QUICKPASS_*.md
-PROMPT_*.md
-
-AGENTS.md
+*.md
+!README.md
 docs/

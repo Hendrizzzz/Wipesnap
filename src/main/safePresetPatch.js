@@ -638,6 +638,7 @@ function expectedSourceForType(type) {
 function expectedIdPrefixesForType(type) {
     if (type === 'account-intention') return ['accti_']
     if (type === 'profile-intention') return ['profi_']
+    if (type === 'browser-tab') return ['item_', 'patch_item_']
     return ['item_']
 }
 
@@ -716,7 +717,7 @@ function validateSnapshotItemRef(value, index, presetIndex) {
     if (ref.metadataOnly !== true) fail(`${fieldName}.metadataOnly must be true.`)
     const next = {
         id: normalizeSafeId(ref.id, `${fieldName}.id`, ['pref_']),
-        itemId: normalizeSafeId(ref.itemId, `${fieldName}.itemId`, ['item_', 'accti_', 'profi_']),
+        itemId: normalizeSafeId(ref.itemId, `${fieldName}.itemId`, ['item_', 'accti_', 'profi_', 'patch_item_']),
         order: normalizeOrder(ref.order, `${fieldName}.order`),
         enabled: normalizeOptionalBoolean(ref.enabled, `${fieldName}.enabled`),
         metadataOnly: true
@@ -841,6 +842,12 @@ function assertPatchReferencesSnapshot(patch, snapshot, indexes) {
 
     if (snapshot.availableItems.length + patch.newBrowserItems.length > SANITIZED_PRESET_SNAPSHOT_LIMITS.maxAvailableItems) {
         fail('safe preset patch would exceed the sanitized snapshot available item limit.')
+    }
+
+    for (const item of patch.newBrowserItems) {
+        if (indexes.availableItems.has(item.id)) {
+            fail('safe preset patch new browser item id already exists in the sanitized snapshot.')
+        }
     }
 
     for (const presetPatch of patch.presets) {

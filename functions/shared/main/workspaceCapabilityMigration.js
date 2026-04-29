@@ -14,6 +14,7 @@ import {
     validateWorkspaceInput
 } from './ipcValidation.js'
 import { isDangerousExecutablePath } from './appManifest.js'
+import { WORKSPACE_SAFE_PRESET_METADATA_KEY } from './safePresetMetadata.js'
 
 export const WORKSPACE_CAPABILITY_VAULT_KEY = 'launchCapabilityVault'
 export const WORKSPACE_CAPABILITY_MIGRATION_REPORT_KEY = 'launchCapabilityMigration'
@@ -73,6 +74,7 @@ const RAW_LAUNCH_AUTHORITY_FIELDS = new Set([
 const RENDERER_WORKSPACE_INTERNAL_FIELDS = new Set([
     WORKSPACE_CAPABILITY_VAULT_KEY,
     WORKSPACE_CAPABILITY_MIGRATION_REPORT_KEY,
+    WORKSPACE_SAFE_PRESET_METADATA_KEY,
     'accountSlots'
 ])
 const RENDERER_CAPABILITY_ENTRY_KEYS = new Set([

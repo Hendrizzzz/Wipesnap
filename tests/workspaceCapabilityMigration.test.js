@@ -11,6 +11,7 @@ import {
     sanitizeWorkspaceForRenderer,
     workspaceEntryHasRawLaunchAuthority
 } from '../src/main/workspaceCapabilityMigration.js'
+import { WORKSPACE_SAFE_PRESET_METADATA_KEY } from '../src/main/safePresetMetadata.js'
 
 const FIXED_NOW = '2026-04-25T00:00:00.000Z'
 
@@ -345,6 +346,12 @@ test('workspace capability migration preserves encrypted account slots but rende
         desktopApps: [],
         accountSlots
     }), /accountSlots is main-owned/)
+
+    assert.throws(() => prepareRendererWorkspaceSave({
+        webTabs: [],
+        desktopApps: [],
+        [WORKSPACE_SAFE_PRESET_METADATA_KEY]: { version: 1 }
+    }), /safePresetMetadata is main-owned/)
 })
 
 test('renderer-invented raw launch path cannot be saved or launched', () => {

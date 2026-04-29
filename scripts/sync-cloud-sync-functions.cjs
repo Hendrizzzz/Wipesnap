@@ -14,6 +14,7 @@ const sharedFiles = [
     'cloudSyncEnvelope.js',
     'cloudSyncIngestion.js',
     'ipcValidation.js',
+    'safePresetMetadata.js',
     'safePresetPatch.js',
     'sanitizedPresetSnapshot.js',
     'workspaceCapabilityMigration.js'

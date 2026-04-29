@@ -6,6 +6,10 @@ import {
     WORKSPACE_CAPABILITY_VAULT_KEY,
     workspaceEntryHasRawLaunchAuthority
 } from './workspaceCapabilityMigration.js'
+import {
+    SAFE_PRESET_METADATA_VERSION,
+    WORKSPACE_SAFE_PRESET_METADATA_KEY
+} from './safePresetMetadata.js'
 
 export const SANITIZED_PRESET_SNAPSHOT_SCHEMA_VERSION = 1
 export const SANITIZED_PRESET_SNAPSHOT_KIND = 'sanitized-preset-snapshot'
@@ -73,6 +77,41 @@ const AVAILABLE_ITEM_KEYS = new Set([
     'provider',
     'identifierHint',
     'state',
+    'metadataOnly'
+])
+const SAFE_PRESET_METADATA_KEYS = new Set([
+    'version',
+    'metadataOnly',
+    'source',
+    'lastMergedPatchId',
+    'lastMergedPatchRevisionId',
+    'baseSnapshotRevisionId',
+    'mergedAt',
+    'selection',
+    'presets',
+    'newBrowserItems'
+])
+const SAFE_PRESET_METADATA_SELECTION_KEYS = new Set(['defaultPresetId', 'nextPresetId', 'metadataOnly', 'selectionKind'])
+const SAFE_PRESET_METADATA_PRESET_KEYS = new Set(['id', 'name', 'order', 'enabled', 'itemRefs', 'metadataOnly'])
+const SAFE_PRESET_METADATA_REF_KEYS = new Set([
+    'id',
+    'itemId',
+    'order',
+    'enabled',
+    'accountIntentionId',
+    'profileIntentionId',
+    'metadataOnly'
+])
+const SAFE_PRESET_METADATA_BROWSER_ITEM_KEYS = new Set([
+    'id',
+    'type',
+    'source',
+    'url',
+    'label',
+    'notes',
+    'enabled',
+    'accountIntentionId',
+    'profileIntentionId',
     'metadataOnly'
 ])
 
@@ -397,6 +436,204 @@ function addSourceKey(sourceIndex, key, itemId) {
         fail('Snapshot item source references produced conflicting safe ids.')
     }
     sourceIndex.set(key, itemId)
+}
+
+function normalizeSafeMetadataId(value, fieldName, prefixes, { nullable = false } = {}) {
+    if (value == null || value === '') {
+        if (nullable) return null
+        fail(`${fieldName} is required.`)
+    }
+    const id = normalizeRequiredString(value, fieldName, SANITIZED_PRESET_SNAPSHOT_LIMITS.maxIdLength)
+    if (!/^[A-Za-z][A-Za-z0-9_-]+$/.test(id)) fail(`${fieldName} must be a safe id.`)
+    if (CAPABILITY_ID_PATTERN.test(id) || RAW_ACCOUNT_SLOT_ID_PATTERN.test(id)) {
+        fail(`${fieldName} cannot use a raw authority id shape.`)
+    }
+    if (!prefixes.some(prefix => id.startsWith(prefix))) {
+        fail(`${fieldName} must use an allowed safe id prefix.`)
+    }
+    return id
+}
+
+function normalizeSafeMetadataOptionalIntentionId(value, fieldName, prefix) {
+    if (value == null || value === '') return ''
+    return normalizeSafeMetadataId(value, fieldName, [prefix])
+}
+
+function normalizeSafeMetadataOrder(value, fieldName) {
+    if (!Number.isSafeInteger(value) || value < 0) fail(`${fieldName} must be a non-negative integer.`)
+    return value
+}
+
+function normalizeSafeMetadataBoolean(value, fieldName, defaultValue = true) {
+    if (value == null) return defaultValue
+    if (typeof value !== 'boolean') fail(`${fieldName} must be a boolean.`)
+    return value
+}
+
+function addMergedSafeBrowserItems(metadata, availableItems) {
+    const values = assertArrayLimit(
+        metadata.newBrowserItems,
+        `${WORKSPACE_SAFE_PRESET_METADATA_KEY}.newBrowserItems`,
+        SANITIZED_PRESET_SNAPSHOT_LIMITS.maxBrowserItems
+    )
+    const itemIds = new Set(availableItems.map(item => item.id))
+    const accountIds = new Set(availableItems.filter(item => item.type === 'account-intention').map(item => item.id))
+    const profileIds = new Set(availableItems.filter(item => item.type === 'profile-intention').map(item => item.id))
+    const newItems = []
+    for (const [index, input] of values.entries()) {
+        const fieldName = `${WORKSPACE_SAFE_PRESET_METADATA_KEY}.newBrowserItems[${index}]`
+        const item = requireObject(input, fieldName)
+        assertAllowedKeys(item, SAFE_PRESET_METADATA_BROWSER_ITEM_KEYS, fieldName)
+        if (item.metadataOnly !== true) fail(`${fieldName}.metadataOnly must be true.`)
+        if (item.type != null && item.type !== 'browser-tab') fail(`${fieldName}.type must be browser-tab.`)
+        if (item.source != null && item.source !== 'phone-patch') fail(`${fieldName}.source must be phone-patch.`)
+        const id = normalizeSafeMetadataId(item.id, `${fieldName}.id`, ['patch_item_'])
+        addUniqueValue(itemIds, id, `${WORKSPACE_SAFE_PRESET_METADATA_KEY}.newBrowserItems`)
+        const safeUrl = normalizePublicBrowserUrl(item.url)
+        if (!safeUrl || safeUrl !== item.url) fail(`${fieldName}.url is not an accepted public browser URL.`)
+        const accountIntentionId = normalizeSafeMetadataOptionalIntentionId(item.accountIntentionId, `${fieldName}.accountIntentionId`, 'accti_')
+        const profileIntentionId = normalizeSafeMetadataOptionalIntentionId(item.profileIntentionId, `${fieldName}.profileIntentionId`, 'profi_')
+        if (accountIntentionId && !accountIds.has(accountIntentionId)) {
+            fail(`${fieldName}.accountIntentionId references an unknown account intention.`)
+        }
+        if (profileIntentionId && !profileIds.has(profileIntentionId)) {
+            fail(`${fieldName}.profileIntentionId references an unknown profile intention.`)
+        }
+        const label = safeText(item.label, hostnameLabel(safeUrl), {
+            max: SANITIZED_PRESET_SNAPSHOT_LIMITS.maxItemLabelLength
+        })
+        newItems.push({
+            id,
+            type: 'browser-tab',
+            label,
+            status: item.enabled === false ? 'disabled' : 'available',
+            source: 'browser',
+            url: safeUrl
+        })
+    }
+    if (availableItems.length + newItems.length > SANITIZED_PRESET_SNAPSHOT_LIMITS.maxAvailableItems) {
+        fail('availableItems exceeds the sanitized snapshot limit.')
+    }
+    availableItems.push(...newItems)
+}
+
+function normalizeSafePresetMetadataSelection(value, presetIds) {
+    const selection = value == null ? {} : requireObject(value, `${WORKSPACE_SAFE_PRESET_METADATA_KEY}.selection`)
+    assertAllowedKeys(selection, SAFE_PRESET_METADATA_SELECTION_KEYS, `${WORKSPACE_SAFE_PRESET_METADATA_KEY}.selection`)
+    if (selection.metadataOnly != null && selection.metadataOnly !== true) {
+        fail(`${WORKSPACE_SAFE_PRESET_METADATA_KEY}.selection.metadataOnly must be true.`)
+    }
+    if (selection.selectionKind != null && selection.selectionKind !== 'metadata-only') {
+        fail(`${WORKSPACE_SAFE_PRESET_METADATA_KEY}.selection.selectionKind must be metadata-only.`)
+    }
+    const defaultPresetId = normalizeSafeMetadataId(selection.defaultPresetId, `${WORKSPACE_SAFE_PRESET_METADATA_KEY}.selection.defaultPresetId`, ['preset_'], {
+        nullable: true
+    })
+    const nextPresetId = normalizeSafeMetadataId(selection.nextPresetId, `${WORKSPACE_SAFE_PRESET_METADATA_KEY}.selection.nextPresetId`, ['preset_'], {
+        nullable: true
+    })
+    if (defaultPresetId && !presetIds.has(defaultPresetId)) {
+        fail(`${WORKSPACE_SAFE_PRESET_METADATA_KEY}.selection.defaultPresetId references an unknown preset.`)
+    }
+    if (nextPresetId && !presetIds.has(nextPresetId)) {
+        fail(`${WORKSPACE_SAFE_PRESET_METADATA_KEY}.selection.nextPresetId references an unknown preset.`)
+    }
+    return {
+        defaultPresetId,
+        nextPresetId,
+        metadataOnly: true,
+        selectionKind: 'metadata-only'
+    }
+}
+
+function buildMergedSafePresetEntries(metadata, availableItems) {
+    const values = assertArrayLimit(
+        metadata.presets,
+        `${WORKSPACE_SAFE_PRESET_METADATA_KEY}.presets`,
+        SANITIZED_PRESET_SNAPSHOT_LIMITS.maxPresets
+    )
+    const itemIds = new Set(availableItems.map(item => item.id))
+    const accountIds = new Set(availableItems.filter(item => item.type === 'account-intention').map(item => item.id))
+    const profileIds = new Set(availableItems.filter(item => item.type === 'profile-intention').map(item => item.id))
+    const seenPresetIds = new Set()
+    return values.map((presetInput, presetIndex) => {
+        const fieldName = `${WORKSPACE_SAFE_PRESET_METADATA_KEY}.presets[${presetIndex}]`
+        const preset = requireObject(presetInput, fieldName)
+        assertAllowedKeys(preset, SAFE_PRESET_METADATA_PRESET_KEYS, fieldName)
+        if (preset.metadataOnly !== true) fail(`${fieldName}.metadataOnly must be true.`)
+        const id = normalizeSafeMetadataId(preset.id, `${fieldName}.id`, ['preset_'])
+        addUniqueValue(seenPresetIds, id, `${WORKSPACE_SAFE_PRESET_METADATA_KEY}.presets`)
+        const refs = assertArrayLimit(
+            preset.itemRefs,
+            `${fieldName}.itemRefs`,
+            SANITIZED_PRESET_SNAPSHOT_LIMITS.maxPresetItemRefs
+        )
+        const seenRefIds = new Set()
+        const seenItemIds = new Set()
+        const itemRefs = refs.map((refInput, refIndex) => {
+            const refFieldName = `${fieldName}.itemRefs[${refIndex}]`
+            const ref = requireObject(refInput, refFieldName)
+            assertAllowedKeys(ref, SAFE_PRESET_METADATA_REF_KEYS, refFieldName)
+            if (ref.metadataOnly !== true) fail(`${refFieldName}.metadataOnly must be true.`)
+            const itemId = normalizeSafeMetadataId(ref.itemId, `${refFieldName}.itemId`, ['item_', 'accti_', 'profi_', 'patch_item_'])
+            if (!itemIds.has(itemId)) fail(`${refFieldName}.itemId references an unknown safe item.`)
+            addUniqueValue(seenItemIds, itemId, `${fieldName}.itemRefs`)
+            const accountIntentionId = normalizeSafeMetadataOptionalIntentionId(ref.accountIntentionId, `${refFieldName}.accountIntentionId`, 'accti_')
+            const profileIntentionId = normalizeSafeMetadataOptionalIntentionId(ref.profileIntentionId, `${refFieldName}.profileIntentionId`, 'profi_')
+            if (accountIntentionId && !accountIds.has(accountIntentionId)) {
+                fail(`${refFieldName}.accountIntentionId references an unknown account intention.`)
+            }
+            if (profileIntentionId && !profileIds.has(profileIntentionId)) {
+                fail(`${refFieldName}.profileIntentionId references an unknown profile intention.`)
+            }
+            const refId = ref.id
+                ? normalizeSafeMetadataId(ref.id, `${refFieldName}.id`, ['pref_'])
+                : deriveSafeId(Buffer.from(id), 'preset-item-ref', {
+                    presetId: id,
+                    itemId,
+                    order: ref.order ?? refIndex
+                })
+            addUniqueValue(seenRefIds, refId, `${fieldName}.itemRefs`)
+            return {
+                id: refId,
+                itemId,
+                order: normalizeSafeMetadataOrder(ref.order, `${refFieldName}.order`),
+                enabled: normalizeSafeMetadataBoolean(ref.enabled, `${refFieldName}.enabled`, true),
+                ...(accountIntentionId ? { accountIntentionId } : {}),
+                ...(profileIntentionId ? { profileIntentionId } : {}),
+                metadataOnly: true
+            }
+        })
+        return {
+            rawKey: id,
+            preset: {
+                id,
+                name: safeText(preset.name, `Preset ${presetIndex + 1}`, {
+                    max: SANITIZED_PRESET_SNAPSHOT_LIMITS.maxPresetNameLength
+                }),
+                order: normalizeSafeMetadataOrder(preset.order, `${fieldName}.order`),
+                enabled: normalizeSafeMetadataBoolean(preset.enabled, `${fieldName}.enabled`, true),
+                itemRefs
+            }
+        }
+    })
+}
+
+function normalizeMergedSafePresetMetadata(value, availableItems) {
+    if (value == null) return null
+    const metadata = requireObject(value, WORKSPACE_SAFE_PRESET_METADATA_KEY)
+    assertAllowedKeys(metadata, SAFE_PRESET_METADATA_KEYS, WORKSPACE_SAFE_PRESET_METADATA_KEY)
+    if (metadata.version !== SAFE_PRESET_METADATA_VERSION) {
+        fail(`${WORKSPACE_SAFE_PRESET_METADATA_KEY}.version is not supported.`)
+    }
+    if (metadata.metadataOnly !== true) fail(`${WORKSPACE_SAFE_PRESET_METADATA_KEY}.metadataOnly must be true.`)
+    addMergedSafeBrowserItems(metadata, availableItems)
+    const presetEntries = buildMergedSafePresetEntries(metadata, availableItems)
+    const presetIds = new Set(presetEntries.map(entry => entry.preset.id))
+    return {
+        presetEntries,
+        selection: normalizeSafePresetMetadataSelection(metadata.selection, presetIds)
+    }
 }
 
 function desktopItemTypeForRecord(record) {
@@ -867,7 +1104,11 @@ export function buildSanitizedPresetSnapshot(input = {}) {
         secret
     })
 
-    const presetEntries = Array.isArray(options.presets || workspace.presets)
+    const mergedSafePresetMetadata = options.presets
+        ? null
+        : normalizeMergedSafePresetMetadata(workspace[WORKSPACE_SAFE_PRESET_METADATA_KEY], availableItems)
+
+    const presetEntries = mergedSafePresetMetadata?.presetEntries || (Array.isArray(options.presets || workspace.presets)
         ? buildExplicitPresets({
             presets: options.presets || workspace.presets,
             sourceIndex,
@@ -883,6 +1124,7 @@ export function buildSanitizedPresetSnapshot(input = {}) {
             profileIdByRaw,
             secret
         })]
+    )
 
     if (presetEntries.length > SANITIZED_PRESET_SNAPSHOT_LIMITS.maxPresets) {
         fail('presets exceeds the sanitized snapshot limit.')
@@ -896,6 +1138,12 @@ export function buildSanitizedPresetSnapshot(input = {}) {
 
     const defaultPresetRaw = options.defaultPresetId ?? workspace.defaultPresetId ?? presetEntries.find(entry => entry.preset.enabled)?.rawKey ?? presetEntries[0]?.rawKey ?? null
     const nextPresetRaw = options.nextPresetId ?? workspace.nextPresetId ?? null
+    const selection = mergedSafePresetMetadata?.selection || {
+        defaultPresetId: resolveSelectionId(defaultPresetRaw, presetIdByRawKey),
+        nextPresetId: resolveSelectionId(nextPresetRaw, presetIdByRawKey),
+        metadataOnly: true,
+        selectionKind: 'metadata-only'
+    }
     const snapshot = {
         product: 'wipesnap',
         kind: SANITIZED_PRESET_SNAPSHOT_KIND,
@@ -906,12 +1154,7 @@ export function buildSanitizedPresetSnapshot(input = {}) {
         sourceDeviceId: deriveSafeId(secret, 'source-device', { sourceDeviceId: sourceDeviceMaterial }),
         timestamp,
         limits: { ...SANITIZED_PRESET_SNAPSHOT_LIMITS },
-        selection: {
-            defaultPresetId: resolveSelectionId(defaultPresetRaw, presetIdByRawKey),
-            nextPresetId: resolveSelectionId(nextPresetRaw, presetIdByRawKey),
-            metadataOnly: true,
-            selectionKind: 'metadata-only'
-        },
+        selection,
         presets: presetEntries
             .map(entry => entry.preset)
             .sort((a, b) => a.order - b.order || a.name.localeCompare(b.name)),

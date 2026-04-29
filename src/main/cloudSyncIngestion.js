@@ -23,6 +23,12 @@ export const CLOUD_SYNC_INGESTION_OPERATIONS = Object.freeze({
     snapshotEnvelope: 'snapshot-envelope',
     patchEnvelope: 'patch-envelope'
 })
+export const CLOUD_SYNC_ADMIN_OPERATIONS = Object.freeze({
+    bootstrapDesktopDevice: 'bootstrap-desktop-device',
+    requestDeviceEnrollment: 'request-device-enrollment',
+    approveDeviceEnrollment: 'approve-device-enrollment',
+    revokeDevice: 'revoke-device'
+})
 
 const DEVICE_ROLES = new Set(['desktop', 'phone', 'web-planner'])
 const DEVICE_ID_PATTERN = /^dev_[A-Za-z0-9_-]{1,92}$/
@@ -122,6 +128,10 @@ function documentHash(document) {
     return sha256Base64Url(Buffer.from(serializeCanonicalCloudSyncMetadata(document), 'utf8'))
 }
 
+function emptyToNull(value) {
+    return value == null || value === '' ? null : value
+}
+
 export function createCloudSyncIngestionSignatureMetadata({
     operation,
     ownerUid,
@@ -139,6 +149,34 @@ export function createCloudSyncIngestionSignatureMetadata({
         operation,
         ownerUid,
         deviceId,
+        deviceSequence,
+        enrollmentEpoch,
+        keyVersion,
+        documentId,
+        documentHash: documentHash(document),
+        requestedAt
+    })
+}
+
+export function createCloudSyncAdminSignatureMetadata({
+    operation,
+    ownerUid,
+    actorDeviceId,
+    targetDeviceId,
+    deviceSequence,
+    enrollmentEpoch,
+    keyVersion,
+    documentId,
+    document,
+    requestedAt
+}) {
+    return serializeCanonicalCloudSyncMetadata({
+        product: 'wipesnap',
+        schemaVersion: CLOUD_SYNC_INGESTION_SCHEMA_VERSION,
+        operation,
+        ownerUid,
+        actorDeviceId: emptyToNull(actorDeviceId),
+        targetDeviceId,
         deviceSequence,
         enrollmentEpoch,
         keyVersion,
@@ -211,6 +249,51 @@ function verifyDetachedIngestionSignature({
     if (!valid) fail('permission-denied', 'Cloud sync ingestion request signature is not valid.')
 }
 
+function verifyDetachedAdminSignature({
+    operation,
+    ownerUid,
+    actorDevice,
+    targetDeviceId,
+    documentId,
+    document,
+    deviceSequence,
+    enrollmentEpoch,
+    keyVersion,
+    requestedAt,
+    signature
+}) {
+    if (!isPlainObject(signature)) fail('permission-denied', 'Cloud sync admin request signature is required.')
+    if (signature.alg !== CLOUD_SYNC_SIGNING_ALGORITHM) {
+        fail('permission-denied', 'Cloud sync admin request signature algorithm is not supported.')
+    }
+    if (signature.keyId !== actorDevice.deviceId) {
+        fail('permission-denied', 'Cloud sync admin request signature key does not match the actor device.')
+    }
+    const canonicalMetadata = createCloudSyncAdminSignatureMetadata({
+        operation,
+        ownerUid,
+        actorDeviceId: actorDevice.deviceId,
+        targetDeviceId,
+        deviceSequence,
+        enrollmentEpoch,
+        keyVersion,
+        documentId,
+        document,
+        requestedAt
+    })
+    let valid = false
+    try {
+        valid = verifyCloudSyncCanonicalMetadata({
+            canonicalMetadata,
+            signature: signature.value,
+            publicKey: publicKeyFromDeviceRecord(actorDevice)
+        })
+    } catch (error) {
+        permissionDeniedFrom(error)
+    }
+    if (!valid) fail('permission-denied', 'Cloud sync admin request signature is not valid.')
+}
+
 function requireScope(device, scope) {
     if (!Array.isArray(device.syncScopes) || !device.syncScopes.includes(scope)) {
         fail('permission-denied', `Cloud sync ingestion requires ${scope} scope.`)
@@ -268,6 +351,13 @@ async function requireExistingActiveDevice(tx, authContext) {
     }
     assertActiveDevice(authContext, device)
     return { path, device }
+}
+
+async function requireExistingActiveDesktop(tx, authContext) {
+    requireRole(authContext, ['desktop'], 'Only desktop devices may approve cloud sync authority changes.')
+    const active = await requireExistingActiveDevice(tx, authContext)
+    requireScope(active.device, 'read')
+    return active
 }
 
 async function assertCreateOnly(tx, path) {
@@ -643,6 +733,311 @@ export async function ingestCloudSyncDocument(input = {}) {
         if (error instanceof CloudSyncIngestionError) throw error
         fail('invalid-argument', error.message || 'Cloud sync ingestion failed closed.')
     }
+}
+
+function normalizeSignedInOwnerAuth(auth) {
+    if (!isPlainObject(auth) || !auth.uid) fail('unauthenticated', 'Cloud sync admin operation requires authentication.')
+    return { uid: normalizeOwnerUid(auth.uid, 'auth.uid') }
+}
+
+function deviceAuthClaims(device) {
+    return {
+        wipesnapDeviceId: device.deviceId,
+        wipesnapDeviceRole: device.role,
+        wipesnapEnrollmentEpoch: device.enrollmentEpoch,
+        wipesnapKeyVersion: device.keyVersion
+    }
+}
+
+async function issueDeviceSessionToken({ authIssuer, ownerUid, device }) {
+    if (!authIssuer || typeof authIssuer.createCustomToken !== 'function') {
+        fail('failed-precondition', 'Cloud sync device session issuance requires an Auth admin issuer.')
+    }
+    const claims = deviceAuthClaims(device)
+    const deviceSessionToken = await authIssuer.createCustomToken(ownerUid, claims)
+    return {
+        customClaims: claims,
+        deviceSessionToken,
+        deviceSessionSignInRequired: true
+    }
+}
+
+function normalizeEnrollmentRequestId(input, fallbackDeviceId) {
+    const id = input == null || input === '' ? fallbackDeviceId : input
+    return normalizeDeviceId(id, 'requestId')
+}
+
+function enrollmentRequestPath(uid, requestId) {
+    return userPath(uid, 'deviceEnrollmentRequests', requestId)
+}
+
+function validateDeviceRecordForAdmin({
+    document,
+    ownerUid,
+    documentId,
+    expectedStatus,
+    expectedRole
+}) {
+    let device
+    try {
+        device = validateCloudSyncDeviceRecord(document)
+    } catch (error) {
+        invalidArgumentFrom(error)
+    }
+    if (device.ownerUid !== ownerUid) fail('permission-denied', 'Device owner does not match caller.')
+    if (device.deviceId !== documentId) fail('invalid-argument', 'Device id must match the target document id.')
+    if (expectedStatus && device.status !== expectedStatus) {
+        fail('invalid-argument', `Device record status must be ${expectedStatus}.`)
+    }
+    if (expectedRole && device.role !== expectedRole) {
+        fail('permission-denied', `Device record role must be ${expectedRole}.`)
+    }
+    if (device.revokedAt != null) fail('permission-denied', 'Revoked devices cannot be enrolled.')
+    assertNoForbiddenCloudSyncBackendPlaintext(device)
+    return device
+}
+
+export async function bootstrapCloudSyncDesktopDevice(input = {}) {
+    if (!isPlainObject(input)) fail('invalid-argument', 'Cloud sync bootstrap input must be an object.')
+    if (!input.store || typeof input.store.runTransaction !== 'function') {
+        fail('failed-precondition', 'Cloud sync bootstrap requires a Firestore Admin store.')
+    }
+    const ownerAuth = normalizeSignedInOwnerAuth(input.auth)
+    const now = normalizeTimestamp(input.now, 'now', Date.now())
+    const requestedAt = normalizeTimestamp(input.requestedAt, 'requestedAt', now)
+    const document = clone(input.document)
+    const documentId = normalizeDeviceId(input.documentId, 'documentId')
+
+    const result = await input.store.runTransaction(async tx => {
+        const device = validateDeviceRecordForAdmin({
+            document,
+            ownerUid: ownerAuth.uid,
+            documentId,
+            expectedStatus: 'active',
+            expectedRole: 'desktop'
+        })
+        requireScope(device, 'read')
+        requireScope(device, 'snapshot-upload')
+        verifyDetachedAdminSignature({
+            operation: CLOUD_SYNC_ADMIN_OPERATIONS.bootstrapDesktopDevice,
+            ownerUid: ownerAuth.uid,
+            actorDevice: device,
+            targetDeviceId: device.deviceId,
+            documentId: device.deviceId,
+            document: device,
+            deviceSequence: device.deviceSequence,
+            enrollmentEpoch: device.enrollmentEpoch,
+            keyVersion: device.keyVersion,
+            requestedAt,
+            signature: input.signature
+        })
+
+        const statePath = userPath(ownerAuth.uid, 'state', 'enrollment')
+        if (await tx.get(statePath)) fail('already-exists', 'Cloud sync desktop authority is already bootstrapped.')
+        const devicePath = userPath(ownerAuth.uid, 'devices', device.deviceId)
+        await assertCreateOnly(tx, devicePath)
+        await tx.create(devicePath, { ...device, updatedAt: Math.max(device.updatedAt, now) })
+        await tx.set(statePath, {
+            ownerUid: ownerAuth.uid,
+            keyVersion: device.keyVersion,
+            desktopAuthorityDeviceId: device.deviceId,
+            enrollmentEpoch: device.enrollmentEpoch,
+            bootstrappedAt: now,
+            updatedAt: now
+        })
+        return { status: 'accepted', deviceId: device.deviceId, device }
+    })
+    const issued = await issueDeviceSessionToken({
+        authIssuer: input.authIssuer,
+        ownerUid: ownerAuth.uid,
+        device: result.device
+    })
+    return { status: result.status, deviceId: result.deviceId, device: result.device, ...issued }
+}
+
+export async function requestCloudSyncDeviceEnrollment(input = {}) {
+    if (!isPlainObject(input)) fail('invalid-argument', 'Cloud sync enrollment request input must be an object.')
+    if (!input.store || typeof input.store.runTransaction !== 'function') {
+        fail('failed-precondition', 'Cloud sync enrollment request requires a Firestore Admin store.')
+    }
+    const ownerAuth = normalizeSignedInOwnerAuth(input.auth)
+    const now = normalizeTimestamp(input.now, 'now', Date.now())
+    const requestedAt = normalizeTimestamp(input.requestedAt, 'requestedAt', now)
+    const document = clone(input.document)
+    const documentId = normalizeDeviceId(input.documentId, 'documentId')
+
+    return input.store.runTransaction(async tx => {
+        const device = validateDeviceRecordForAdmin({
+            document,
+            ownerUid: ownerAuth.uid,
+            documentId,
+            expectedStatus: 'pending'
+        })
+        if (device.role === 'desktop') fail('permission-denied', 'Additional desktop enrollment is not supported in this slice.')
+        verifyDetachedAdminSignature({
+            operation: CLOUD_SYNC_ADMIN_OPERATIONS.requestDeviceEnrollment,
+            ownerUid: ownerAuth.uid,
+            actorDevice: device,
+            targetDeviceId: device.deviceId,
+            documentId: device.deviceId,
+            document: device,
+            deviceSequence: device.deviceSequence,
+            enrollmentEpoch: device.enrollmentEpoch,
+            keyVersion: device.keyVersion,
+            requestedAt,
+            signature: input.signature
+        })
+
+        const requestId = normalizeEnrollmentRequestId(input.requestId, device.deviceId)
+        const requestPath = enrollmentRequestPath(ownerAuth.uid, requestId)
+        await assertCreateOnly(tx, requestPath)
+        await tx.create(requestPath, {
+            ownerUid: ownerAuth.uid,
+            requestId,
+            status: 'pending',
+            device,
+            requestedAt: now,
+            updatedAt: now
+        })
+        return { status: 'pending', requestId, deviceId: device.deviceId }
+    })
+}
+
+export async function approveCloudSyncDeviceEnrollment(input = {}) {
+    if (!isPlainObject(input)) fail('invalid-argument', 'Cloud sync enrollment approval input must be an object.')
+    if (!input.store || typeof input.store.runTransaction !== 'function') {
+        fail('failed-precondition', 'Cloud sync enrollment approval requires a Firestore Admin store.')
+    }
+    const authContext = normalizeAuth(input.auth)
+    const requestId = normalizeEnrollmentRequestId(input.requestId, input.documentId)
+    const now = normalizeTimestamp(input.now, 'now', Date.now())
+    const requestedAt = normalizeTimestamp(input.requestedAt, 'requestedAt', now)
+
+    const result = await input.store.runTransaction(async tx => {
+        const { device: approver } = await requireExistingActiveDesktop(tx, authContext)
+        const requestPath = enrollmentRequestPath(authContext.uid, requestId)
+        const request = await tx.get(requestPath)
+        if (!isPlainObject(request) || request.status !== 'pending') {
+            fail('failed-precondition', 'Cloud sync enrollment request is not pending.')
+        }
+        const pending = validateDeviceRecordForAdmin({
+            document: request.device,
+            ownerUid: authContext.uid,
+            documentId: requestId,
+            expectedStatus: 'pending'
+        })
+        if (pending.role === 'desktop') fail('permission-denied', 'Additional desktop enrollment is not supported in this slice.')
+        verifyDetachedAdminSignature({
+            operation: CLOUD_SYNC_ADMIN_OPERATIONS.approveDeviceEnrollment,
+            ownerUid: authContext.uid,
+            actorDevice: approver,
+            targetDeviceId: pending.deviceId,
+            documentId: requestId,
+            document: pending,
+            deviceSequence: input.deviceSequence == null
+                ? approver.deviceSequence + 1
+                : normalizeNonNegativeInteger(input.deviceSequence, 'deviceSequence'),
+            enrollmentEpoch: authContext.enrollmentEpoch,
+            keyVersion: authContext.keyVersion,
+            requestedAt,
+            signature: input.signature
+        })
+
+        const approved = {
+            ...pending,
+            status: 'active',
+            updatedAt: now,
+            revokedAt: null,
+            revokedByDeviceId: null
+        }
+        const devicePath = userPath(authContext.uid, 'devices', approved.deviceId)
+        await assertCreateOnly(tx, devicePath)
+        await tx.create(devicePath, approved)
+        await tx.set(requestPath, {
+            ...request,
+            status: 'approved',
+            approvedAt: now,
+            approvedByDeviceId: approver.deviceId,
+            device: approved,
+            updatedAt: now
+        })
+        return { status: 'approved', requestId, deviceId: approved.deviceId, device: approved }
+    })
+    const issued = await issueDeviceSessionToken({
+        authIssuer: input.authIssuer,
+        ownerUid: authContext.uid,
+        device: result.device
+    })
+    return {
+        status: result.status,
+        requestId: result.requestId,
+        deviceId: result.deviceId,
+        device: result.device,
+        ...issued
+    }
+}
+
+export async function revokeCloudSyncDevice(input = {}) {
+    if (!isPlainObject(input)) fail('invalid-argument', 'Cloud sync revocation input must be an object.')
+    if (!input.store || typeof input.store.runTransaction !== 'function') {
+        fail('failed-precondition', 'Cloud sync revocation requires a Firestore Admin store.')
+    }
+    const authContext = normalizeAuth(input.auth)
+    const targetDeviceId = normalizeDeviceId(input.targetDeviceId, 'targetDeviceId')
+    const now = normalizeTimestamp(input.now, 'now', Date.now())
+    const requestedAt = normalizeTimestamp(input.requestedAt, 'requestedAt', now)
+    const deviceSequence = normalizeNonNegativeInteger(input.deviceSequence, 'deviceSequence')
+
+    return input.store.runTransaction(async tx => {
+        const { path: approverPath, device: approver } = await requireExistingActiveDesktop(tx, authContext)
+        assertMonotonicDeviceSequence(approver, deviceSequence)
+        if (targetDeviceId === approver.deviceId) fail('permission-denied', 'Desktop devices cannot revoke themselves in this slice.')
+        const targetPath = userPath(authContext.uid, 'devices', targetDeviceId)
+        const targetRaw = await tx.get(targetPath)
+        if (!targetRaw) fail('failed-precondition', 'Target device is not enrolled.')
+        let target
+        try {
+            target = validateCloudSyncDeviceRecord(targetRaw)
+        } catch (error) {
+            fail('failed-precondition', error.message || 'Target device record is invalid.')
+        }
+        if (target.ownerUid !== authContext.uid) fail('permission-denied', 'Target device owner does not match caller.')
+        if (target.status !== 'active' || target.revokedAt != null) fail('failed-precondition', 'Target device is not active.')
+        verifyDetachedAdminSignature({
+            operation: CLOUD_SYNC_ADMIN_OPERATIONS.revokeDevice,
+            ownerUid: authContext.uid,
+            actorDevice: approver,
+            targetDeviceId,
+            documentId: targetDeviceId,
+            document: target,
+            deviceSequence,
+            enrollmentEpoch: authContext.enrollmentEpoch,
+            keyVersion: authContext.keyVersion,
+            requestedAt,
+            signature: input.signature
+        })
+
+        await tx.set(targetPath, {
+            ...target,
+            status: 'revoked',
+            revokedAt: now,
+            revokedByDeviceId: approver.deviceId,
+            updatedAt: now
+        })
+        await updateDeviceSequence(tx, approverPath, approver, deviceSequence, now)
+        return {
+            status: 'revoked',
+            deviceId: targetDeviceId,
+            cachedClientDataMayRemain: true
+        }
+    })
+}
+
+export async function approveCloudSyncKeyGrant(input = {}) {
+    return ingestCloudSyncDocument({
+        ...input,
+        operation: CLOUD_SYNC_INGESTION_OPERATIONS.keyGrant
+    })
 }
 
 export function createFirestoreAdminStore(db) {

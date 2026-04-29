@@ -18,8 +18,15 @@ import {
 } from '../src/main/cloudSyncEnvelope.js'
 import {
     CLOUD_SYNC_INGESTION_OPERATIONS,
+    CLOUD_SYNC_ADMIN_OPERATIONS,
+    approveCloudSyncDeviceEnrollment,
+    approveCloudSyncKeyGrant,
+    bootstrapCloudSyncDesktopDevice,
+    createCloudSyncAdminSignatureMetadata,
     createCloudSyncIngestionSignatureMetadata,
-    ingestCloudSyncDocument
+    ingestCloudSyncDocument,
+    requestCloudSyncDeviceEnrollment,
+    revokeCloudSyncDevice
 } from '../src/main/cloudSyncIngestion.js'
 import { evaluateCloudSyncFirestoreAccess } from '../src/main/cloudSyncRulesPolicy.js'
 import { SANITIZED_PRESET_SNAPSHOT_LIMITS } from '../src/main/sanitizedPresetSnapshot.js'
@@ -255,6 +262,51 @@ function ingestionSignature({ operation, device, keys, documentId, document, seq
             }),
             privateKey: keys.privateKey
         })
+    }
+}
+
+function adminSignature({
+    operation,
+    ownerUid = UID,
+    actorDevice,
+    targetDeviceId,
+    keys,
+    documentId,
+    document,
+    sequence,
+    enrollmentEpoch = actorDevice.enrollmentEpoch,
+    keyVersion = actorDevice.keyVersion,
+    requestedAt = NOW
+}) {
+    return {
+        alg: CLOUD_SYNC_SIGNING_ALGORITHM,
+        keyId: actorDevice.deviceId,
+        value: signCloudSyncCanonicalMetadata({
+            canonicalMetadata: createCloudSyncAdminSignatureMetadata({
+                operation,
+                ownerUid,
+                actorDeviceId: actorDevice.deviceId,
+                targetDeviceId,
+                deviceSequence: sequence,
+                enrollmentEpoch,
+                keyVersion,
+                documentId,
+                document,
+                requestedAt
+            }),
+            privateKey: keys.privateKey
+        })
+    }
+}
+
+function authIssuerRecorder() {
+    const issued = []
+    return {
+        issued,
+        createCustomToken(uid, claims) {
+            issued.push({ uid, claims: clone(claims) })
+            return Promise.resolve(`device-session-token:${uid}:${claims.wipesnapDeviceId}`)
+        }
     }
 }
 
@@ -611,6 +663,198 @@ test('Device record ingestion validates claims, doc id, and detached device sign
             sequence: device.deviceSequence
         })
     }), 'already-exists', /already exists|replayed/)
+})
+
+test('Device enrollment, claim issuance, approval, and revocation stay desktop-authorized', async () => {
+    const store = new InMemoryFirestoreEmulator()
+    const issuer = authIssuerRecorder()
+    const desktopKeys = signingKeyPair()
+    const phoneKeys = signingKeyPair()
+    const desktop = deviceRecord({
+        deviceId: 'dev_desktop_phase21_3',
+        role: 'desktop',
+        syncScopes: ['read', 'snapshot-upload'],
+        keys: desktopKeys,
+        sequence: 1
+    })
+    const bootstrap = await bootstrapCloudSyncDesktopDevice({
+        store,
+        authIssuer: issuer,
+        auth: { uid: UID, token: {} },
+        documentId: desktop.deviceId,
+        document: desktop,
+        signature: adminSignature({
+            operation: CLOUD_SYNC_ADMIN_OPERATIONS.bootstrapDesktopDevice,
+            actorDevice: desktop,
+            targetDeviceId: desktop.deviceId,
+            keys: desktopKeys,
+            documentId: desktop.deviceId,
+            document: desktop,
+            sequence: desktop.deviceSequence
+        }),
+        requestedAt: NOW,
+        now: NOW + 10
+    })
+    assert.equal(bootstrap.status, 'accepted')
+    assert.deepEqual(issuer.issued.at(-1), {
+        uid: UID,
+        claims: authFor(desktop).token
+    })
+    assert.equal(bootstrap.deviceSessionToken, `device-session-token:${UID}:${desktop.deviceId}`)
+    assert.equal(bootstrap.deviceSessionSignInRequired, true)
+
+    const pendingPhone = deviceRecord({
+        deviceId: 'dev_phone_phase21_3',
+        role: 'phone',
+        syncScopes: ['read', 'patch-upload'],
+        keys: phoneKeys,
+        sequence: 1,
+        status: 'pending'
+    })
+    const request = await requestCloudSyncDeviceEnrollment({
+        store,
+        auth: { uid: UID, token: {} },
+        requestId: pendingPhone.deviceId,
+        documentId: pendingPhone.deviceId,
+        document: pendingPhone,
+        signature: adminSignature({
+            operation: CLOUD_SYNC_ADMIN_OPERATIONS.requestDeviceEnrollment,
+            actorDevice: pendingPhone,
+            targetDeviceId: pendingPhone.deviceId,
+            keys: phoneKeys,
+            documentId: pendingPhone.deviceId,
+            document: pendingPhone,
+            sequence: pendingPhone.deviceSequence
+        }),
+        requestedAt: NOW,
+        now: NOW + 20
+    })
+    assert.equal(request.status, 'pending')
+
+    await assertRejectsCode(() => approveCloudSyncDeviceEnrollment({
+        store,
+        authIssuer: issuer,
+        auth: authFor({ ...pendingPhone, status: 'active' }),
+        requestId: pendingPhone.deviceId,
+        signature: adminSignature({
+            operation: CLOUD_SYNC_ADMIN_OPERATIONS.approveDeviceEnrollment,
+            actorDevice: pendingPhone,
+            targetDeviceId: pendingPhone.deviceId,
+            keys: phoneKeys,
+            documentId: pendingPhone.deviceId,
+            document: pendingPhone,
+            sequence: 2
+        }),
+        deviceSequence: 2,
+        requestedAt: NOW,
+        now: NOW + 25
+    }), 'permission-denied', /desktop|enrolled/)
+
+    const approval = await approveCloudSyncDeviceEnrollment({
+        store,
+        authIssuer: issuer,
+        auth: authFor(desktop),
+        requestId: pendingPhone.deviceId,
+        signature: adminSignature({
+            operation: CLOUD_SYNC_ADMIN_OPERATIONS.approveDeviceEnrollment,
+            actorDevice: desktop,
+            targetDeviceId: pendingPhone.deviceId,
+            keys: desktopKeys,
+            documentId: pendingPhone.deviceId,
+            document: pendingPhone,
+            sequence: 2
+        }),
+        deviceSequence: 2,
+        requestedAt: NOW,
+        now: NOW + 30
+    })
+    assert.equal(approval.status, 'approved')
+    const activePhone = store.get(`users/${UID}/devices/${pendingPhone.deviceId}`)
+    assert.equal(activePhone.status, 'active')
+    assert.deepEqual(issuer.issued.at(-1), {
+        uid: UID,
+        claims: authFor(activePhone).token
+    })
+    assert.equal(approval.deviceSessionToken, `device-session-token:${UID}:${activePhone.deviceId}`)
+    assert.equal(approval.deviceSessionSignInRequired, true)
+
+    const revokedRead = store.evaluateClient({
+        path: `/users/${UID}/devices/${activePhone.deviceId}`,
+        operation: 'get',
+        auth: authFor(activePhone)
+    })
+    assert.equal(revokedRead.allowed, true)
+
+    const currentDesktop = store.get(`users/${UID}/devices/${desktop.deviceId}`)
+    const revoke = await revokeCloudSyncDevice({
+        store,
+        auth: authFor(currentDesktop),
+        targetDeviceId: activePhone.deviceId,
+        signature: adminSignature({
+            operation: CLOUD_SYNC_ADMIN_OPERATIONS.revokeDevice,
+            actorDevice: currentDesktop,
+            targetDeviceId: activePhone.deviceId,
+            keys: desktopKeys,
+            documentId: activePhone.deviceId,
+            document: activePhone,
+            sequence: 3
+        }),
+        deviceSequence: 3,
+        requestedAt: NOW,
+        now: NOW + 40
+    })
+    assert.equal(revoke.status, 'revoked')
+    assert.equal(revoke.cachedClientDataMayRemain, true)
+    const revokedPhone = store.get(`users/${UID}/devices/${activePhone.deviceId}`)
+    assert.equal(revokedPhone.status, 'revoked')
+    assert.equal(revokedPhone.revokedByDeviceId, desktop.deviceId)
+
+    const deniedRead = store.evaluateClient({
+        path: `/users/${UID}/devices/${activePhone.deviceId}`,
+        operation: 'get',
+        auth: authFor(activePhone)
+    })
+    assert.equal(deniedRead.allowed, false)
+    assert.equal(deniedRead.reason, 'revoked-device-denied')
+
+    const patch = patchFixture({
+        patchRevisionId: 'patchrev_phase21_3_revoked',
+        authorDeviceId: activePhone.deviceId
+    })
+    const patchEnvelope = envelopeFor({
+        docType: CLOUD_SYNC_PATCH_DOC_TYPE,
+        payload: patch,
+        device: activePhone,
+        keys: phoneKeys,
+        sequence: 2
+    })
+    await assertRejectsCode(() => ingest({
+        store,
+        auth: authFor(activePhone),
+        operation: CLOUD_SYNC_INGESTION_OPERATIONS.patchEnvelope,
+        documentId: patchEnvelope.revisionId,
+        document: patchEnvelope
+    }), 'permission-denied', /revoked|active/)
+
+    const desktopAfterRevoke = store.get(`users/${UID}/devices/${desktop.deviceId}`)
+    const grant = keyGrantRecord({ desktop: desktopAfterRevoke, phone: revokedPhone, sequence: 4 })
+    await assertRejectsCode(() => approveCloudSyncKeyGrant({
+        store,
+        auth: authFor(desktopAfterRevoke),
+        documentId: grant.grantId,
+        document: grant,
+        deviceSequence: 4,
+        signature: ingestionSignature({
+            operation: CLOUD_SYNC_INGESTION_OPERATIONS.keyGrant,
+            device: desktopAfterRevoke,
+            keys: desktopKeys,
+            documentId: grant.grantId,
+            document: grant,
+            sequence: 4
+        }),
+        requestedAt: NOW,
+        now: NOW + 50
+    }), 'permission-denied', /recipient/)
 })
 
 test('Functions ingestion denies anonymous, cross-user, missing-claim, stale, revoked, replayed, and tampered writes', async () => {

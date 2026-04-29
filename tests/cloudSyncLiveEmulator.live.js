@@ -5,7 +5,9 @@ import { test } from 'node:test'
 import { initializeApp, deleteApp } from 'firebase/app'
 import { getAuth, connectAuthEmulator, signInAnonymously, signInWithCustomToken } from 'firebase/auth'
 import {
+    collection,
     doc,
+    getDocs,
     getDoc,
     setDoc,
     connectFirestoreEmulator,
@@ -35,6 +37,12 @@ import {
     createCloudSyncDeviceSessionClaimDocument,
     createCloudSyncIngestionSignatureMetadata
 } from '../src/main/cloudSyncIngestion.js'
+import {
+    downloadDesktopPatchPlans,
+    downloadPhoneLatestSnapshot,
+    uploadDesktopSanitizedSnapshot,
+    uploadPhoneSafePresetPatch
+} from '../src/main/cloudSyncClientTransport.js'
 import { SANITIZED_PRESET_SNAPSHOT_LIMITS } from '../src/main/sanitizedPresetSnapshot.js'
 
 const PROJECT_ID = process.env.GCLOUD_PROJECT || process.env.FIREBASE_PROJECT || 'wipesnap-phase21-live'
@@ -393,6 +401,22 @@ async function readLiveAdminDocs(paths) {
     return docs
 }
 
+function liveFirestoreClient(db, trustedDevices = new Map()) {
+    return {
+        async getDocument(path) {
+            const snapshot = await getDoc(doc(db, path))
+            return snapshot.exists() ? snapshot.data() : null
+        },
+        async listDocuments(path) {
+            const snapshot = await getDocs(collection(db, path))
+            return snapshot.docs.map(document => document.data())
+        },
+        getTrustedDeviceRecord({ deviceId }) {
+            return Promise.resolve(trustedDevices.get(deviceId) || null)
+        }
+    }
+}
+
 test('Live Firestore rules deny non-device, stale, revoked, cross-user, and direct writes', async () => {
     const rules = readFileSync('firestore.rules', 'utf8')
     const testEnv = await initializeTestEnvironment({
@@ -690,7 +714,7 @@ test('Live Functions emulator enforces independent device sessions, ingestion, k
                 sequence: 2
             }),
             requestedAt: NOW
-        }, ownerToken, /replayed|stale/)
+        }, ownerToken, /already been claimed/)
 
         const claimedPhoneForClaims = { ...activePhone, deviceSequence: 2 }
         const phoneToken = await signInDeviceSession(phoneClient, claimedSession.deviceSessionToken, claimedPhoneForClaims)
@@ -791,6 +815,274 @@ test('Live Functions emulator enforces independent device sessions, ingestion, k
             `users/${ownerUid}/snapshots/${secondSnapshotEnvelope.revisionId}`
         ])
         for (const backendDoc of backendDocs) assertNoForbiddenCloudSyncBackendPlaintext(backendDoc)
+        const serializedBackendDocs = JSON.stringify(backendDocs)
+        for (const forbidden of [
+            bootstrap.deviceSessionToken,
+            claimedSession.deviceSessionToken,
+            pairingChallenge,
+            'deviceSessionToken',
+            'syncRootKey',
+            'rootKeyMaterial',
+            'vault.json',
+            'capability',
+            'password'
+        ]) {
+            assert.equal(serializedBackendDocs.includes(forbidden), false, `backend doc leaked ${forbidden}`)
+        }
+    } finally {
+        await Promise.allSettled([
+            deleteApp(ownerClient.app),
+            deleteApp(desktopClient.app),
+            deleteApp(phoneClient.app)
+        ])
+    }
+})
+
+test('Live client transport uploads snapshots, phone patches offline, and desktop validates patches without merge', async () => {
+    const suffix = Date.now()
+    const ownerClient = initializeLiveClient(`phase21-live-transport-owner-${suffix}`)
+    const desktopClient = initializeLiveClient(`phase21-live-transport-desktop-${suffix}`)
+    const phoneClient = initializeLiveClient(`phase21-live-transport-phone-${suffix}`)
+
+    try {
+        await signInAnonymously(ownerClient.auth)
+        const ownerUid = ownerClient.auth.currentUser.uid
+        const ownerToken = await ownerClient.auth.currentUser.getIdToken()
+        const desktopKeys = signingKeyPair()
+        const phoneKeys = signingKeyPair()
+        const desktop = deviceRecord({
+            ownerUid,
+            deviceId: 'dev_live_transport_desktop',
+            role: 'desktop',
+            syncScopes: ['read', 'snapshot-upload'],
+            keys: desktopKeys,
+            sequence: 1
+        })
+        const bootstrap = await callCallable('bootstrapCloudSyncDesktopDevice', {
+            documentId: desktop.deviceId,
+            document: desktop,
+            signature: adminSignature({
+                operation: CLOUD_SYNC_ADMIN_OPERATIONS.bootstrapDesktopDevice,
+                ownerUid,
+                actorDevice: desktop,
+                targetDeviceId: desktop.deviceId,
+                keys: desktopKeys,
+                documentId: desktop.deviceId,
+                document: desktop,
+                sequence: desktop.deviceSequence
+            }),
+            requestedAt: NOW
+        }, ownerToken)
+        let desktopToken = await signInDeviceSession(desktopClient, bootstrap.deviceSessionToken, desktop)
+        let desktopState = {
+            ownerUid,
+            device: desktop,
+            syncRootKey: SYNC_ROOT_KEY,
+            signingPrivateKey: desktopKeys.privateKey
+        }
+        const desktopStorage = {
+            loadAfterUnlock: () => Promise.resolve(desktopState),
+            updateDeviceSequence: sequence => {
+                desktopState = {
+                    ...desktopState,
+                    device: { ...desktopState.device, deviceSequence: sequence }
+                }
+                return Promise.resolve()
+            }
+        }
+        const desktopFunctions = {
+            callCloudSyncFunction: (name, data) => callCallable(name, data, desktopToken)
+        }
+        const desktopSnapshot = await uploadDesktopSanitizedSnapshot({
+            storage: desktopStorage,
+            functionsClient: desktopFunctions,
+            snapshotBuilder: ({ device }) => snapshotFixture({
+                ownerDeviceId: device.deviceId,
+                revisionId: 'srev_phase21_live_transport_snapshot_1'
+            }),
+            now: NOW
+        })
+        assert.equal(desktopSnapshot.status, 'accepted')
+        const backendSnapshot = (await getDoc(doc(
+            desktopClient.db,
+            `users/${ownerUid}/snapshots/${desktopSnapshot.revisionId}`
+        ))).data()
+        assertNoForbiddenCloudSyncBackendPlaintext(backendSnapshot)
+        assert.equal(JSON.stringify(backendSnapshot).includes('Live Coding'), false)
+
+        const pendingPhone = deviceRecord({
+            ownerUid,
+            deviceId: 'dev_live_transport_phone',
+            role: 'phone',
+            syncScopes: ['read', 'patch-upload'],
+            keys: phoneKeys,
+            sequence: 1,
+            status: 'pending'
+        })
+        const pairingChallenge = 'pairing_phase21_live_transport'
+        await callCallable('requestCloudSyncDeviceEnrollment', {
+            requestId: pendingPhone.deviceId,
+            documentId: pendingPhone.deviceId,
+            document: pendingPhone,
+            pairingChallenge,
+            signature: adminSignature({
+                operation: CLOUD_SYNC_ADMIN_OPERATIONS.requestDeviceEnrollment,
+                ownerUid,
+                actorDevice: pendingPhone,
+                targetDeviceId: pendingPhone.deviceId,
+                keys: phoneKeys,
+                documentId: pendingPhone.deviceId,
+                document: pendingPhone,
+                sequence: pendingPhone.deviceSequence
+            }),
+            requestedAt: NOW
+        }, ownerToken)
+
+        const approval = await callCallable('approveCloudSyncDeviceEnrollment', {
+            requestId: pendingPhone.deviceId,
+            documentId: pendingPhone.deviceId,
+            signature: adminSignature({
+                operation: CLOUD_SYNC_ADMIN_OPERATIONS.approveDeviceEnrollment,
+                ownerUid,
+                actorDevice: desktopState.device,
+                targetDeviceId: pendingPhone.deviceId,
+                keys: desktopKeys,
+                documentId: pendingPhone.deviceId,
+                document: pendingPhone,
+                sequence: 3
+            }),
+            deviceSequence: 3,
+            requestedAt: NOW
+        }, desktopToken)
+        const activePhone = approval.device
+        desktopToken = await refreshDeviceSessionToken(desktopClient, desktop)
+
+        const keyGrant = keyGrantRecord({
+            ownerUid,
+            desktop: desktopState.device,
+            phone: activePhone,
+            sequence: 4
+        })
+        await callCallable('approveCloudSyncKeyGrant', {
+            documentId: keyGrant.grantId,
+            document: keyGrant,
+            deviceSequence: 4,
+            signature: ingestionSignature({
+                operation: CLOUD_SYNC_INGESTION_OPERATIONS.keyGrant,
+                ownerUid,
+                device: desktopState.device,
+                keys: desktopKeys,
+                documentId: keyGrant.grantId,
+                document: keyGrant,
+                sequence: 4
+            }),
+            requestedAt: NOW
+        }, desktopToken)
+        desktopState = {
+            ...desktopState,
+            device: { ...desktopState.device, deviceSequence: 4 }
+        }
+
+        const claimDocument = createCloudSyncDeviceSessionClaimDocument({
+            requestId: activePhone.deviceId,
+            deviceId: activePhone.deviceId,
+            keyGrantId: keyGrant.grantId,
+            pairingChallengeHash: sha256Base64Url(Buffer.from(pairingChallenge, 'utf8'))
+        })
+        const claimedSession = await callCallable('claimApprovedCloudSyncDeviceSession', {
+            requestId: activePhone.deviceId,
+            deviceId: activePhone.deviceId,
+            keyGrantId: keyGrant.grantId,
+            pairingChallenge,
+            deviceSequence: 2,
+            signature: adminSignature({
+                operation: CLOUD_SYNC_ADMIN_OPERATIONS.claimDeviceSession,
+                ownerUid,
+                actorDevice: activePhone,
+                targetDeviceId: activePhone.deviceId,
+                keys: phoneKeys,
+                documentId: activePhone.deviceId,
+                document: claimDocument,
+                sequence: 2
+            }),
+            requestedAt: NOW
+        }, ownerToken)
+        const claimedPhone = { ...activePhone, deviceSequence: 2 }
+        const phoneToken = await signInDeviceSession(phoneClient, claimedSession.deviceSessionToken, claimedPhone)
+        let phoneState = {
+            ownerUid,
+            device: claimedPhone,
+            syncRootKey: SYNC_ROOT_KEY,
+            signingPrivateKey: phoneKeys.privateKey
+        }
+        const phoneStorage = {
+            cachedSnapshots: [],
+            cachedPatches: [],
+            loadSessionState: () => Promise.resolve(phoneState),
+            cacheEncryptedSnapshotEnvelope(envelope) {
+                this.cachedSnapshots.push(envelope)
+                return Promise.resolve()
+            },
+            cacheEncryptedPatchEnvelope(envelope) {
+                this.cachedPatches.push(envelope)
+                return Promise.resolve()
+            },
+            updateDeviceSequence(sequence) {
+                phoneState = { ...phoneState, device: { ...phoneState.device, deviceSequence: sequence } }
+                return Promise.resolve()
+            }
+        }
+        const phoneSnapshot = await downloadPhoneLatestSnapshot({
+            storage: phoneStorage,
+            firestoreClient: liveFirestoreClient(phoneClient.db, new Map([[desktop.deviceId, desktop]]))
+        })
+        assert.equal(phoneSnapshot.snapshot.revisionId, desktopSnapshot.revisionId)
+        assert.equal(phoneSnapshot.snapshot.presets[0].name, 'Live Coding')
+
+        const phonePatch = await uploadPhoneSafePresetPatch({
+            storage: phoneStorage,
+            functionsClient: {
+                callCloudSyncFunction: (name, data) => callCallable(name, data, phoneToken)
+            },
+            baseSnapshot: phoneSnapshot.snapshot,
+            patchBuilder: ({ baseSnapshot, device }) => patchFixture({
+                authorDeviceId: device.deviceId,
+                baseSnapshotRevisionId: baseSnapshot.revisionId,
+                patchRevisionId: 'patchrev_phase21_live_transport_phone_1'
+            }),
+            now: NOW + 10
+        })
+        assert.equal(phonePatch.status, 'accepted')
+        assert.equal(phoneStorage.cachedSnapshots.length, 1)
+        assert.equal(phoneStorage.cachedPatches.length, 1)
+
+        const backendPatch = (await getDoc(doc(
+            desktopClient.db,
+            `users/${ownerUid}/patches/${phonePatch.patchRevisionId}`
+        ))).data()
+        assertNoForbiddenCloudSyncBackendPlaintext(backendPatch)
+        assert.equal(JSON.stringify(backendPatch).includes('Live Coding'), false)
+
+        desktopToken = await refreshDeviceSessionToken(desktopClient, desktop)
+        const planned = await downloadDesktopPatchPlans({
+            storage: desktopStorage,
+            firestoreClient: liveFirestoreClient(desktopClient.db, new Map([[phoneState.device.deviceId, phoneState.device]])),
+            sanitizedSnapshot: phoneSnapshot.snapshot,
+            patchRevisionIds: [phonePatch.patchRevisionId]
+        })
+        assert.equal(planned.status, 'planned')
+        assert.equal(planned.plans.length, 1)
+        assert.equal(planned.plans[0].importPlan.sideEffects.writesVault, false)
+        assert.equal(planned.plans[0].importPlan.sideEffects.launches, false)
+        assert.equal(planned.sideEffects.mergesPatch, false)
+        assert.equal(planned.plans[0].importPlan.patchRevisionId, phonePatch.patchRevisionId)
+
+        const backendDocs = await readLiveAdminDocs([
+            `users/${ownerUid}/snapshots/${desktopSnapshot.revisionId}`,
+            `users/${ownerUid}/patches/${phonePatch.patchRevisionId}`,
+            `users/${ownerUid}/deviceEnrollmentRequests/${activePhone.deviceId}`,
+            `users/${ownerUid}/keyGrants/${keyGrant.grantId}`
+        ])
         const serializedBackendDocs = JSON.stringify(backendDocs)
         for (const forbidden of [
             bootstrap.deviceSessionToken,

@@ -907,7 +907,29 @@ test('Device enrollment, claim issuance, approval, and revocation stay desktop-a
         }),
         requestedAt: NOW,
         now: NOW + 36
-    }), 'already-exists', /replayed|stale/)
+    }), 'failed-precondition', /already been claimed/)
+
+    await assertRejectsCode(() => claimApprovedCloudSyncDeviceSession({
+        store,
+        authIssuer: issuer,
+        auth: { uid: UID, token: {} },
+        requestId: activePhone.deviceId,
+        deviceId: activePhone.deviceId,
+        keyGrantId: approvalGrant.grantId,
+        pairingChallenge,
+        deviceSequence: 3,
+        signature: adminSignature({
+            operation: CLOUD_SYNC_ADMIN_OPERATIONS.claimDeviceSession,
+            actorDevice: { ...activePhone, deviceSequence: 2 },
+            targetDeviceId: activePhone.deviceId,
+            keys: phoneKeys,
+            documentId: activePhone.deviceId,
+            document: claimDocument,
+            sequence: 3
+        }),
+        requestedAt: NOW,
+        now: NOW + 37
+    }), 'failed-precondition', /already been claimed/)
 
     const claimedPhone = store.get(`users/${UID}/devices/${activePhone.deviceId}`)
     const revokedRead = store.evaluateClient({

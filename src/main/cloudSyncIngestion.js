@@ -1048,9 +1048,13 @@ export async function claimApprovedCloudSyncDeviceSession(input = {}) {
     const result = await input.store.runTransaction(async tx => {
         const requestPath = enrollmentRequestPath(ownerAuth.uid, requestId)
         const request = await tx.get(requestPath)
-        if (!isPlainObject(request) || request.status !== 'approved') {
+        if (!isPlainObject(request)) {
             fail('failed-precondition', 'Cloud sync enrollment request is not approved.')
         }
+        if (request.status === 'claimed') {
+            fail('failed-precondition', 'Cloud sync enrollment request has already been claimed.')
+        }
+        if (request.status !== 'approved') fail('failed-precondition', 'Cloud sync enrollment request is not approved.')
         if (request.ownerUid !== ownerAuth.uid) fail('permission-denied', 'Enrollment request owner does not match caller.')
         if (request.requestId !== requestId) fail('failed-precondition', 'Enrollment request id does not match caller.')
         if (request.pairingChallengeAlg !== 'SHA-256-BASE64URL' || request.pairingChallengeHash !== pairingChallengeHash) {
@@ -1158,6 +1162,10 @@ export async function claimApprovedCloudSyncDeviceSession(input = {}) {
         await updateDeviceSequence(tx, devicePath, device, deviceSequence, now)
         await tx.set(requestPath, {
             ...request,
+            status: 'claimed',
+            claimedAt: now,
+            claimedByDeviceId: device.deviceId,
+            claimedKeyGrantId: keyGrant.grantId,
             lastClaimedAt: now,
             lastClaimedByDeviceId: device.deviceId,
             lastClaimKeyGrantId: keyGrant.grantId,

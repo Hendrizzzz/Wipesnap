@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import ImportAppsModal from './ImportAppsModal'
+import { createCloudSyncStatusView } from '../cloudSyncStatusUi'
 
 const ACCOUNT_SLOT_STATES = [
     'unknown',
@@ -52,6 +53,8 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
     const [showAccountSlotForm, setShowAccountSlotForm] = useState(false)
     const [editingAccountSlotId, setEditingAccountSlotId] = useState(null)
     const [accountSlotForm, setAccountSlotForm] = useState(EMPTY_ACCOUNT_SLOT_FORM)
+    const [cloudSyncBusyAction, setCloudSyncBusyAction] = useState('')
+    const [cloudSyncStatusView, setCloudSyncStatusView] = useState(() => createCloudSyncStatusView())
 
     const [showAppForm, setShowAppForm] = useState(false)
     const [appForm, setAppForm] = useState({ name: '', path: '', args: '', portableData: false })
@@ -464,6 +467,53 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         }
     }
 
+    const runCloudSyncAction = async (operation, invokeAction) => {
+        if (cloudSyncBusyAction) return
+        setCloudSyncBusyAction(operation)
+        setError('')
+        try {
+            const result = await invokeAction()
+            setCloudSyncStatusView(createCloudSyncStatusView(result))
+        } catch (err) {
+            setCloudSyncStatusView(createCloudSyncStatusView({
+                success: false,
+                operation,
+                status: 'rejected',
+                error: err?.message || 'Cloud sync did not complete.',
+                summary: {
+                    uploaded: 0,
+                    downloaded: 0,
+                    planned: 0,
+                    applied: 0,
+                    conflicts: 0,
+                    skipped: 0
+                }
+            }))
+        } finally {
+            setCloudSyncBusyAction('')
+        }
+    }
+
+    const uploadCloudSnapshot = () => runCloudSyncAction(
+        'upload-sanitized-snapshot',
+        () => window.wipesnap.cloudSync.uploadSanitizedSnapshot({})
+    )
+
+    const downloadCloudPatchSummaries = () => runCloudSyncAction(
+        'download-encrypted-patch-summaries',
+        () => window.wipesnap.cloudSync.downloadEncryptedPatchSummaries({})
+    )
+
+    const planCloudPatches = () => runCloudSyncAction(
+        'plan-safe-preset-patches',
+        () => window.wipesnap.cloudSync.planSafePresetPatches({})
+    )
+
+    const applyTrustedCloudPatches = () => runCloudSyncAction(
+        'apply-trusted-patches',
+        () => window.wipesnap.cloudSync.applyTrustedPatches({})
+    )
+
     const refreshStaleAppDataPayloads = async () => {
         if (!window.wipesnap?.scanStaleAppData) return
         const requestId = ++staleAppDataScanRef.current
@@ -738,6 +788,13 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         if (status === 'missing') return 'No data'
         if (status === 'empty') return 'Empty'
         return status || 'Unknown'
+    }
+
+    const getCloudSyncStatusClass = (status) => {
+        if (['accepted', 'downloaded', 'planned', 'completed', 'applied'].includes(status)) return 'text-success'
+        if (['conflict', 'skipped', 'already-decided', 'unavailable', 'locked'].includes(status)) return 'text-warning'
+        if (status === 'rejected') return 'text-error'
+        return 'text-muted'
     }
 
     const resetAccountSlotForm = () => {
@@ -1160,6 +1217,105 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                 )}
                             </div>
                         )}
+                    </div>
+                </div>
+            )}
+
+            {/* Cloud Sync */}
+            {!isInSessionMode && (
+                <div className="mb-4">
+                    <div className="flex items-center justify-between mb-2">
+                        <span className="section-label">Cloud Sync</span>
+                        <span className={`text-[10px] font-semibold ${getCloudSyncStatusClass(cloudSyncStatusView.status)}`}>
+                            {cloudSyncStatusView.statusLabel}
+                        </span>
+                    </div>
+
+                    <div className="rounded-md border border-[#2a2a3a] bg-[#14141c] p-3">
+                        <div className="grid grid-cols-2 gap-2">
+                            <button
+                                className="btn-secondary text-[11px] py-2 px-2"
+                                disabled={!!cloudSyncBusyAction}
+                                onClick={uploadCloudSnapshot}
+                            >
+                                {cloudSyncBusyAction === 'upload-sanitized-snapshot' ? 'Uploading...' : 'Upload Snapshot'}
+                            </button>
+                            <button
+                                className="btn-secondary text-[11px] py-2 px-2"
+                                disabled={!!cloudSyncBusyAction}
+                                onClick={downloadCloudPatchSummaries}
+                            >
+                                {cloudSyncBusyAction === 'download-encrypted-patch-summaries' ? 'Checking...' : 'Check Patches'}
+                            </button>
+                            <button
+                                className="btn-secondary text-[11px] py-2 px-2"
+                                disabled={!!cloudSyncBusyAction}
+                                onClick={planCloudPatches}
+                            >
+                                {cloudSyncBusyAction === 'plan-safe-preset-patches' ? 'Planning...' : 'Plan Only'}
+                            </button>
+                            <button
+                                className="btn-secondary text-[11px] py-2 px-2"
+                                disabled={!!cloudSyncBusyAction}
+                                onClick={applyTrustedCloudPatches}
+                            >
+                                {cloudSyncBusyAction === 'apply-trusted-patches' ? 'Applying...' : 'Apply Trusted'}
+                            </button>
+                        </div>
+
+                        <div className="mt-3 rounded bg-[#101018] border border-[#242435] p-2">
+                            <div className="flex items-start justify-between gap-2">
+                                <div className="min-w-0">
+                                    <p className="text-sm text-white font-medium truncate">{cloudSyncStatusView.title}</p>
+                                    <p className="text-[11px] text-muted mt-0.5">{cloudSyncStatusView.message}</p>
+                                </div>
+                                <span className={`text-[10px] font-semibold flex-shrink-0 ${getCloudSyncStatusClass(cloudSyncStatusView.status)}`}>
+                                    {cloudSyncStatusView.statusLabel}
+                                </span>
+                            </div>
+
+                            <div className="grid grid-cols-3 gap-2 mt-3">
+                                <div className="rounded bg-[#14141c] border border-[#242435] p-2">
+                                    <p className="text-[10px] text-muted">Uploaded</p>
+                                    <p className="text-sm text-white">{cloudSyncStatusView.counts.uploaded}</p>
+                                </div>
+                                <div className="rounded bg-[#14141c] border border-[#242435] p-2">
+                                    <p className="text-[10px] text-muted">Planned</p>
+                                    <p className="text-sm text-white">{cloudSyncStatusView.counts.planned}</p>
+                                </div>
+                                <div className="rounded bg-[#14141c] border border-[#242435] p-2">
+                                    <p className="text-[10px] text-muted">Applied</p>
+                                    <p className="text-sm text-white">{cloudSyncStatusView.counts.applied}</p>
+                                </div>
+                                <div className="rounded bg-[#14141c] border border-[#242435] p-2">
+                                    <p className="text-[10px] text-muted">Downloaded</p>
+                                    <p className="text-sm text-white">{cloudSyncStatusView.counts.downloaded}</p>
+                                </div>
+                                <div className="rounded bg-[#14141c] border border-[#242435] p-2">
+                                    <p className="text-[10px] text-muted">Conflicts</p>
+                                    <p className="text-sm text-white">{cloudSyncStatusView.counts.conflicts}</p>
+                                </div>
+                                <div className="rounded bg-[#14141c] border border-[#242435] p-2">
+                                    <p className="text-[10px] text-muted">Skipped</p>
+                                    <p className="text-sm text-white">{cloudSyncStatusView.counts.skipped}</p>
+                                </div>
+                            </div>
+
+                            {cloudSyncStatusView.records.length > 0 && (
+                                <div className="flex flex-col gap-1.5 mt-3">
+                                    {cloudSyncStatusView.records.map((record, index) => (
+                                        <div key={`${record.status}-${record.reason}-${index}`} className="flex items-center justify-between gap-2">
+                                            <span className={`text-[10px] font-semibold ${getCloudSyncStatusClass(record.status)}`}>
+                                                {record.statusLabel}
+                                            </span>
+                                            <span className="text-[10px] text-muted truncate">
+                                                {record.reasonLabel || (record.encrypted ? 'Encrypted metadata' : 'Metadata only')}
+                                            </span>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
                     </div>
                 </div>
             )}

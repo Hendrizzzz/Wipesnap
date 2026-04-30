@@ -124,6 +124,8 @@ import {
 } from './electronShellHardening.js'
 import { loadDiagnosticsSummaryHandlerCore } from './diagnosticsView.js'
 import { loadWorkspaceHealthSummaryHandlerCore } from './workspaceHealth.js'
+import { registerCloudSyncInvocationIpcHandlers } from './cloudSyncInvocation.js'
+import { createCloudSyncRuntimeAdapter } from './cloudSyncRuntime.js'
 
 registerPackagedRendererProtocolScheme(protocol)
 
@@ -635,6 +637,25 @@ function createAccountSlotHandlerDeps() {
     }
 }
 
+function createCloudSyncInvocationHandlerDeps() {
+    const runtime = globalThis.__wipesnapCloudSyncRuntime && typeof globalThis.__wipesnapCloudSyncRuntime === 'object'
+        ? globalThis.__wipesnapCloudSyncRuntime
+        : {}
+    return createCloudSyncRuntimeAdapter({
+        runtime,
+        baseDeps: {
+            requireActiveSession,
+            loadActiveVaultWorkspace,
+            loadVaultMeta,
+            getDriveInfo,
+            getActiveMasterPassword: getActiveMasterPasswordText,
+            encryptVault: encrypt,
+            commitVaultMeta: commitVaultMetaFiles,
+            honeyToken: HONEY_TOKEN
+        }
+    })
+}
+
 function trustedHandle(channel, handler) {
     ipcMain.handle(channel, async (event, ...args) => {
         try {
@@ -681,6 +702,10 @@ function registerIpcHandlers() {
                 getVaultDir
             }
         })
+    })
+    registerCloudSyncInvocationIpcHandlers({
+        trustedHandle,
+        deps: createCloudSyncInvocationHandlerDeps
     })
     trustedHandle('load-account-slots', async (_, input) => {
         return loadAccountSlotsHandlerCore({

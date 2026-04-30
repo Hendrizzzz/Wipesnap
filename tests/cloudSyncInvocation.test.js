@@ -18,8 +18,13 @@ import {
     planSafePresetPatchesInvocationHandlerCore,
     uploadSanitizedSnapshotInvocationHandlerCore
 } from '../src/main/cloudSyncInvocation.js'
+import { createCloudSyncRuntimeAdapter } from '../src/main/cloudSyncRuntime.js'
 import { validateCloudSyncInvocationInput } from '../src/main/ipcValidation.js'
 import { validateCloudSyncInvocationPayload } from '../src/preload/cloudSyncPreloadValidation.js'
+import {
+    cloudSyncStatusViewContainsForbiddenMaterial,
+    createCloudSyncStatusView
+} from '../src/renderer/src/cloudSyncStatusUi.js'
 import { SANITIZED_PRESET_SNAPSHOT_LIMITS } from '../src/main/sanitizedPresetSnapshot.js'
 import { WORKSPACE_CAPABILITY_VAULT_KEY } from '../src/main/workspaceCapabilityMigration.js'
 
@@ -400,24 +405,29 @@ function createCloudHarness() {
     }
 }
 
-test('phase 24 explicit unlocked invocation uploads, downloads, plans, and applies only summary data', async () => {
+test('phase 25 explicit unlocked runtime invocation uploads, downloads, plans, and applies only summary data', async () => {
     const harness = createCloudHarness()
     const snapshot = snapshotFixture({ sourceDeviceId: harness.desktop.deviceId })
     const workspace = workspaceFixture()
     const originalCapabilityVault = clone(workspace[WORKSPACE_CAPABILITY_VAULT_KEY])
     const merge = createMergeDeps(workspace)
     let snapshotBuilds = 0
-    const deps = {
-        ...merge.deps,
-        storage: harness.desktopStorage,
-        firestoreClient: harness.firestoreClient,
-        functionsClient: harness.functionsClient,
-        buildCurrentSanitizedSnapshot: () => {
-            snapshotBuilds += 1
-            return snapshot
+    const deps = createCloudSyncRuntimeAdapter({
+        runtime: {
+            storage: harness.desktopStorage,
+            firestoreClient: harness.firestoreClient,
+            functionsClient: harness.functionsClient,
+            buildCurrentSanitizedSnapshot: () => {
+                snapshotBuilds += 1
+                return snapshot
+            }
         },
-        now: NOW
-    }
+        baseDeps: {
+            ...merge.deps,
+            now: NOW
+        }
+    })
+    assert.equal(deps.cloudSyncRuntime.available, true)
 
     const upload = await uploadSanitizedSnapshotInvocationHandlerCore({ input: {}, deps })
     assert.equal(upload.success, true)
@@ -473,6 +483,119 @@ test('phase 24 explicit unlocked invocation uploads, downloads, plans, and appli
     assert.deepEqual(merge.storedWorkspace()[WORKSPACE_CAPABILITY_VAULT_KEY], originalCapabilityVault)
     assert.equal(JSON.stringify(apply).includes('Coding Phone'), false)
     assert.equal(snapshotBuilds, 3)
+})
+
+test('phase 25 runtime adapter builds a sanitized snapshot from unlocked storage when configured', async () => {
+    const harness = createCloudHarness()
+    const merge = createMergeDeps({
+        name: 'Runtime Snapshot',
+        webTabs: [{
+            id: 'runtime_tab',
+            url: 'https://aistudio.google.com/',
+            label: 'AI Studio',
+            enabled: true
+        }],
+        desktopApps: []
+    })
+    const deps = createCloudSyncRuntimeAdapter({
+        runtime: {
+            storage: harness.desktopStorage,
+            firestoreClient: harness.firestoreClient,
+            functionsClient: harness.functionsClient
+        },
+        baseDeps: {
+            ...merge.deps,
+            now: NOW
+        }
+    })
+
+    assert.equal(deps.cloudSyncRuntime.available, true)
+    const upload = await uploadSanitizedSnapshotInvocationHandlerCore({ input: {}, deps })
+    assert.equal(upload.success, true)
+    assert.equal(upload.status, 'accepted')
+    assert.equal(upload.summary.uploaded, 1)
+    assert.equal(upload.sideEffects.writesVault, false)
+    assert.equal(upload.sideEffects.writesCloudSnapshot, true)
+    assert.equal(JSON.stringify(upload).includes('AI Studio'), false)
+    assert.equal(JSON.stringify(upload).includes('syncRootKey'), false)
+})
+
+test('phase 25 runtime adapter absence fails closed after the vault-session gate', async () => {
+    let activeSessionChecks = 0
+    const deps = createCloudSyncRuntimeAdapter({
+        runtime: null,
+        baseDeps: {
+            requireActiveSession: () => {
+                activeSessionChecks += 1
+            },
+            loadActiveVaultWorkspace: () => {
+                throw new Error('Cloud sync must not load workspace without a configured runtime.')
+            },
+            now: NOW
+        }
+    })
+    assert.equal(deps.cloudSyncRuntime.available, false)
+
+    const upload = await uploadSanitizedSnapshotInvocationHandlerCore({ input: {}, deps })
+    assert.equal(upload.success, false)
+    assert.equal(upload.status, 'unavailable')
+    assert.equal(upload.error, 'Cloud sync is not configured on this desktop.')
+    assert.equal(upload.sideEffects.writesCloudSnapshot, false)
+    assert.equal(activeSessionChecks, 1)
+
+    let lockedChecks = 0
+    const lockedDeps = createCloudSyncRuntimeAdapter({
+        runtime: null,
+        baseDeps: {
+            requireActiveSession: () => {
+                lockedChecks += 1
+                throw new Error('Session is locked')
+            }
+        }
+    })
+    const locked = await downloadEncryptedPatchSummariesInvocationHandlerCore({ input: {}, deps: lockedDeps })
+    assert.equal(locked.success, false)
+    assert.equal(locked.status, 'locked')
+    assert.equal(locked.error, 'Cloud sync requires an active unlocked vault session.')
+    assert.equal(lockedChecks, 1)
+})
+
+test('phase 25 renderer cloud sync status view whitelists summary fields only', () => {
+    const view = createCloudSyncStatusView({
+        success: false,
+        operation: 'apply-trusted-patches',
+        status: 'rejected',
+        error: 'C:\\Users\\Alice\\vault.json bearer raw-token',
+        summary: {
+            uploaded: 9,
+            downloaded: 8,
+            planned: 7,
+            applied: 6,
+            conflicts: 5,
+            skipped: 4
+        },
+        records: [{
+            status: 'skipped',
+            reason: 'invalid-signature',
+            ciphertext: 'encrypted-envelope',
+            importPlan: { presetPlans: [{ next: { name: 'Leaky Phone Patch' } }] },
+            vaultPath: 'C:\\Users\\Alice\\vault.json',
+            capabilityId: `cap_${'a'.repeat(32)}`
+        }],
+        envelope: { ciphertext: 'encrypted-envelope' },
+        patchPayload: { name: 'Leaky Phone Patch' }
+    })
+
+    assert.equal(view.title, 'Trusted apply')
+    assert.equal(view.message, 'Cloud sync did not complete.')
+    assert.equal(view.counts.applied, 6)
+    assert.equal(view.records[0].statusLabel, 'Skipped')
+    assert.equal(view.records[0].reason, 'invalid-signature')
+    assert.equal(cloudSyncStatusViewContainsForbiddenMaterial(view), false)
+    assert.equal(JSON.stringify(view).includes('ciphertext'), false)
+    assert.equal(JSON.stringify(view).includes('Leaky Phone Patch'), false)
+    assert.equal(JSON.stringify(view).includes('vault.json'), false)
+    assert.equal(JSON.stringify(view).includes('cap_'), false)
 })
 
 test('locked cloud sync invocations stop before cloud storage, reads, writes, or planning', async () => {

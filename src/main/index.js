@@ -126,6 +126,7 @@ import { loadDiagnosticsSummaryHandlerCore } from './diagnosticsView.js'
 import { loadWorkspaceHealthSummaryHandlerCore } from './workspaceHealth.js'
 import { registerCloudSyncInvocationIpcHandlers } from './cloudSyncInvocation.js'
 import { createCloudSyncRuntimeAdapter } from './cloudSyncRuntime.js'
+import { createTrustedAutoImportOrchestrator } from './cloudSyncAutoImport.js'
 
 registerPackagedRendererProtocolScheme(protocol)
 
@@ -435,6 +436,7 @@ function setActiveMasterPassword(password) {
     if (!password) {
         if (activeMasterPasswordBuffer) activeMasterPasswordBuffer.fill(0)
         activeMasterPasswordBuffer = null
+        try { cloudSyncAutoImport.markLocked() } catch (_) { }
     } else {
         if (activeMasterPasswordBuffer) activeMasterPasswordBuffer.fill(0)
         activeMasterPasswordBuffer = Buffer.from(password, 'utf-8')
@@ -656,6 +658,26 @@ function createCloudSyncInvocationHandlerDeps() {
     })
 }
 
+function emitCloudSyncAutoImportStatus(status) {
+    for (const win of BrowserWindow.getAllWindows()) {
+        try { win.webContents.send('cloud-sync:auto-import-status', status) } catch (_) { }
+    }
+}
+
+const cloudSyncAutoImport = createTrustedAutoImportOrchestrator({
+    resolveDeps: createCloudSyncInvocationHandlerDeps,
+    onStatus: emitCloudSyncAutoImportStatus,
+    logger: console
+})
+
+function scheduleTrustedAutoImportAfterUnlock() {
+    try {
+        cloudSyncAutoImport.scheduleAfterUnlock()
+    } catch (error) {
+        console.warn('[Wipesnap] trusted auto-import scheduling failed:', error?.message || error)
+    }
+}
+
 function trustedHandle(channel, handler) {
     ipcMain.handle(channel, async (event, ...args) => {
         try {
@@ -707,6 +729,7 @@ function registerIpcHandlers() {
         trustedHandle,
         deps: createCloudSyncInvocationHandlerDeps
     })
+    trustedHandle('cloud-sync:get-auto-import-status', async () => cloudSyncAutoImport.getStatus())
     trustedHandle('load-account-slots', async (_, input) => {
         return loadAccountSlotsHandlerCore({
             input,
@@ -892,6 +915,7 @@ function registerIpcHandlers() {
             // Cache the actual master password for future localized state saves / setting updates
             setActiveMasterPassword(masterPassword)
             resetPinUnlockFailures({ meta, driveInfo, scope: 'exact', method: 'fresh-pin' })
+            scheduleTrustedAutoImportAfterUnlock()
 
             return { success: true, workspace }
         } catch (e) {
@@ -923,6 +947,7 @@ function registerIpcHandlers() {
             setActiveMasterPassword(safePassword)
             const driveInfo = await getDriveInfo()
             resetPinUnlockFailures({ meta, driveInfo, scope: 'vault', method: 'master-password' })
+            scheduleTrustedAutoImportAfterUnlock()
 
             return { success: true, workspace }
         } catch (e) {
@@ -954,6 +979,7 @@ function registerIpcHandlers() {
 
             // Store the master password for session state encryption
             setActiveMasterPassword(masterPassword)
+            scheduleTrustedAutoImportAfterUnlock()
 
             return { success: true, workspace }
         } catch (e) {

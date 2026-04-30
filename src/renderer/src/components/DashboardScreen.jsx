@@ -97,6 +97,30 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         fetchMeta()
     }, [])
 
+    useEffect(() => {
+        let mounted = true
+        const applyAutoImportStatus = (status) => {
+            if (mounted && status?.operation === 'auto-import-trusted-patches') {
+                setCloudSyncStatusView(createCloudSyncStatusView(status))
+            }
+        }
+
+        if (window.wipesnap?.cloudSync?.getAutoImportStatus) {
+            window.wipesnap.cloudSync.getAutoImportStatus()
+                .then(applyAutoImportStatus)
+                .catch(() => {})
+        }
+
+        const unsubscribe = window.wipesnap?.cloudSync?.onAutoImportStatus
+            ? window.wipesnap.cloudSync.onAutoImportStatus(applyAutoImportStatus)
+            : null
+
+        return () => {
+            mounted = false
+            if (typeof unsubscribe === 'function') unsubscribe()
+        }
+    }, [])
+
     // Session edit/recapture state
     const [sessionMode, setSessionMode] = useState(null) // 'edit' | 'recapture'
     const [browserOpen, setBrowserOpen] = useState(false)

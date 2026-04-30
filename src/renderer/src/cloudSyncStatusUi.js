@@ -2,7 +2,8 @@ const OPERATION_LABELS = {
     'upload-sanitized-snapshot': 'Snapshot upload',
     'download-encrypted-patch-summaries': 'Patch download',
     'plan-safe-preset-patches': 'Patch planning',
-    'apply-trusted-patches': 'Trusted apply'
+    'apply-trusted-patches': 'Trusted apply',
+    'auto-import-trusted-patches': 'Trusted auto-import'
 }
 
 const STATUS_LABELS = {
@@ -13,6 +14,9 @@ const STATUS_LABELS = {
     locked: 'Locked',
     unavailable: 'Unavailable',
     rejected: 'Rejected',
+    idle: 'Idle',
+    scheduled: 'Scheduled',
+    running: 'Running',
     conflict: 'Conflict',
     skipped: 'Skipped',
     applied: 'Applied',
@@ -58,6 +62,11 @@ function defaultMessage(result, status) {
     if (result?.operation === 'download-encrypted-patch-summaries') return 'Encrypted patch summaries checked.'
     if (result?.operation === 'plan-safe-preset-patches') return 'Validate-only patch planning complete.'
     if (result?.operation === 'apply-trusted-patches') return 'Trusted patch apply complete.'
+    if (result?.operation === 'auto-import-trusted-patches') {
+        if (status === 'scheduled') return 'Trusted auto-import scheduled.'
+        if (status === 'running') return 'Trusted auto-import running.'
+        return 'Trusted auto-import complete.'
+    }
     return 'Cloud sync action complete.'
 }
 

@@ -67,7 +67,13 @@ const wipesnapApi = {
         uploadSanitizedSnapshot: (data) => invokeCloudSync('cloud-sync:upload-sanitized-snapshot', data),
         downloadEncryptedPatchSummaries: (data) => invokeCloudSync('cloud-sync:download-encrypted-patch-summaries', data),
         planSafePresetPatches: (data) => invokeCloudSync('cloud-sync:plan-safe-preset-patches', data),
-        applyTrustedPatches: (data) => invokeCloudSync('cloud-sync:apply-trusted-patches', data)
+        applyTrustedPatches: (data) => invokeCloudSync('cloud-sync:apply-trusted-patches', data),
+        getAutoImportStatus: () => ipcRenderer.invoke('cloud-sync:get-auto-import-status'),
+        onAutoImportStatus: (callback) => {
+            const listener = (_, data) => callback(data)
+            ipcRenderer.on('cloud-sync:auto-import-status', listener)
+            return () => ipcRenderer.removeListener('cloud-sync:auto-import-status', listener)
+        }
     },
 
     // Automation Engine

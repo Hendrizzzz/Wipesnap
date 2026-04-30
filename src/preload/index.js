@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { validateCloudSyncInvocationPayload } from './cloudSyncPreloadValidation.js'
+import { validateTrustedAutoLaunchSettingPayload } from './autoLaunchPreloadValidation.js'
 
 function invokeCloudSync(channel, data) {
     return ipcRenderer.invoke(channel, validateCloudSyncInvocationPayload(data))
@@ -73,6 +74,23 @@ const wipesnapApi = {
             const listener = (_, data) => callback(data)
             ipcRenderer.on('cloud-sync:auto-import-status', listener)
             return () => ipcRenderer.removeListener('cloud-sync:auto-import-status', listener)
+        }
+    },
+
+    // Trusted Auto-Launch
+    autoLaunch: {
+        getStatus: () => ipcRenderer.invoke('auto-launch:get-status'),
+        cancelCurrentAttempt: () => ipcRenderer.invoke('auto-launch:cancel-current-attempt'),
+        disable: () => ipcRenderer.invoke('auto-launch:disable'),
+        updateSetting: (data) => ipcRenderer.invoke(
+            'auto-launch:update-setting',
+            validateTrustedAutoLaunchSettingPayload(data)
+        ),
+        launchNow: () => ipcRenderer.invoke('auto-launch:launch-now'),
+        onStatus: (callback) => {
+            const listener = (_, data) => callback(data)
+            ipcRenderer.on('auto-launch:status', listener)
+            return () => ipcRenderer.removeListener('auto-launch:status', listener)
         }
     },
 

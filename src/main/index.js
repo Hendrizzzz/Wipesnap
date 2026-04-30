@@ -123,10 +123,18 @@ import {
     registerPackagedRendererProtocolScheme
 } from './electronShellHardening.js'
 import { loadDiagnosticsSummaryHandlerCore } from './diagnosticsView.js'
-import { loadWorkspaceHealthSummaryHandlerCore } from './workspaceHealth.js'
+import {
+    loadWorkspaceHealthSummary,
+    loadWorkspaceHealthSummaryHandlerCore
+} from './workspaceHealth.js'
 import { registerCloudSyncInvocationIpcHandlers } from './cloudSyncInvocation.js'
 import { createCloudSyncRuntimeAdapter } from './cloudSyncRuntime.js'
 import { createTrustedAutoImportOrchestrator } from './cloudSyncAutoImport.js'
+import { verifyTrustedPatchAuthorForAutoLaunch } from './cloudSyncClientTransport.js'
+import {
+    createTrustedAutoLaunchOrchestrator,
+    trustedAutoLaunchStatusContainsForbiddenMaterial
+} from './trustedAutoLaunch.js'
 
 registerPackagedRendererProtocolScheme(protocol)
 
@@ -428,6 +436,145 @@ function authorizeWorkspaceLaunchCapabilities(workspace, options = {}) {
     })
 }
 
+let activeLaunchPromise = null
+let prepareLaunchWorkspaceConfigForLaunch = async (safeWorkspace) => safeWorkspace
+
+function isLaunchActive() {
+    return !!activeLaunchPromise
+}
+
+function trackLaunchPromise(promise) {
+    activeLaunchPromise = promise
+    Promise.resolve(promise).finally(() => {
+        if (activeLaunchPromise === promise) activeLaunchPromise = null
+    }).catch(() => {})
+}
+
+function sanitizeAutoLaunchText(value, fallback = '') {
+    const text = String(value || '')
+        .replace(/https?:\/\/[^\s"'<>]+/gi, '[redacted-url]')
+        .replace(/[?#][A-Za-z0-9_=&%.-]+/g, '')
+        .replace(/[A-Za-z]:\\[^\r\n"']+/g, '[redacted-path]')
+        .replace(/\\\\[^\s"']+/g, '[redacted-path]')
+        .replace(/\bcap_[A-Za-z0-9_-]{4,128}\b/g, '[redacted-id]')
+        .replace(/\bpatchrev_[A-Za-z0-9_-]{4,128}\b/g, '[redacted-id]')
+        .replace(/\s+/g, ' ')
+        .trim()
+    return text || fallback
+}
+
+function sanitizeAutoLaunchStatusMessage(message) {
+    const text = sanitizeAutoLaunchText(message, 'Launching workspace item')
+    if (/^\[Tab\s+\d+\]/i.test(text)) {
+        return text
+            .replace(/\[OK\]\s+.*?(?:\s+-\s+ready)?$/i, '[OK] Browser tab - ready')
+            .replace(/\[WARN\]\s+.*$/i, '[WARN] Browser tab - launch status unavailable')
+    }
+    if (/^\[App\s+\d+\]/i.test(text)) {
+        return text
+            .replace(/\[OK\]\s+.*?(?:\s+-\s+launched)?$/i, '[OK] Desktop item - launched')
+            .replace(/\[WARN\]\s+.*$/i, '[WARN] Desktop item - launch status unavailable')
+    }
+    return text
+}
+
+function summarizeAutoLaunchResults(results) {
+    const webResults = Array.isArray(results?.webResults) ? results.webResults : []
+    const appResults = Array.isArray(results?.appResults) ? results.appResults : []
+    const summarize = (items) => ({
+        total: items.length,
+        succeeded: items.filter(item => item?.success === true).length,
+        failed: items.filter(item => item && item.success === false && item.skipped !== true).length,
+        skipped: items.filter(item => item?.skipped === true).length
+    })
+    return {
+        metadataOnly: true,
+        webResults: [],
+        appResults: [],
+        summary: {
+            browserTabs: summarize(webResults),
+            desktopApps: summarize(appResults),
+            metadataOnly: true
+        }
+    }
+}
+
+function emitTrustedAutoLaunchStatus(status) {
+    const safeStatus = trustedAutoLaunchStatusContainsForbiddenMaterial(status)
+        ? {
+            operation: 'trusted-auto-launch',
+            status: 'blocked',
+            statusCategory: 'blocked',
+            metadataOnly: true,
+            countdownSeconds: 0,
+            presetLabel: '',
+            itemCounts: {
+                total: 0,
+                browserTabs: 0,
+                desktopApps: 0,
+                hostFolders: 0,
+                accountIntentions: 0,
+                profileIntentions: 0,
+                metadataOnly: true
+            },
+            blockerReasonCodes: ['status-sanitized'],
+            recoveryHints: ['Run manual launch if needed.'],
+            diagnostics: {
+                category: 'blocked',
+                blockerReasonCodes: ['status-sanitized'],
+                metadataOnly: true
+            }
+        }
+        : status
+    for (const win of BrowserWindow.getAllWindows()) {
+        try { win.webContents.send('auto-launch:status', safeStatus) } catch (_) { }
+    }
+}
+
+async function launchTrustedAutoLaunchWorkspace(launchWorkspaceConfig, context = {}) {
+    const vaultDir = getVaultDir()
+    const doLaunch = async () => {
+        beginDiagnosticsCycle('launch')
+        await closeBrowser()
+        await closeDesktopApps()
+        return launchWorkspace(launchWorkspaceConfig, (statusMsg) => {
+            const safeStatus = sanitizeAutoLaunchStatusMessage(statusMsg)
+            for (const win of BrowserWindow.getAllWindows()) {
+                try { win.webContents.send('launch-status', safeStatus) } catch (_) { }
+            }
+        }, vaultDir, { skipDiagnosticsCycle: true })
+    }
+    const launchPromise = doLaunch().then((results) => {
+        const sanitizedResults = summarizeAutoLaunchResults(results)
+        for (const win of BrowserWindow.getAllWindows()) {
+            try {
+                win.webContents.send('launch-complete', {
+                    success: true,
+                    results: sanitizedResults,
+                    autoLaunch: true,
+                    metadataOnly: true
+                })
+            } catch (_) { }
+        }
+        return results
+    }).catch((err) => {
+        diagError('trusted-auto-launch', err.message)
+        for (const win of BrowserWindow.getAllWindows()) {
+            try {
+                win.webContents.send('launch-complete', {
+                    success: false,
+                    error: sanitizeAutoLaunchText(err.message, 'Trusted auto-launch failed.'),
+                    autoLaunch: true,
+                    metadataOnly: true
+                })
+            } catch (_) { }
+        }
+        throw err
+    })
+    trackLaunchPromise(launchPromise)
+    return launchPromise
+}
+
 // ─── Cryptographic Memory Buffer ───────────────────────────────────────────────
 let activeMasterPasswordBuffer = null
 let factoryResetToken = null
@@ -437,6 +584,7 @@ function setActiveMasterPassword(password) {
         if (activeMasterPasswordBuffer) activeMasterPasswordBuffer.fill(0)
         activeMasterPasswordBuffer = null
         try { cloudSyncAutoImport.markLocked() } catch (_) { }
+        try { trustedAutoLaunch.markLocked() } catch (_) { }
     } else {
         if (activeMasterPasswordBuffer) activeMasterPasswordBuffer.fill(0)
         activeMasterPasswordBuffer = Buffer.from(password, 'utf-8')
@@ -658,9 +806,41 @@ function createCloudSyncInvocationHandlerDeps() {
     })
 }
 
+function createTrustedAutoLaunchDeps() {
+    const cloudDeps = createCloudSyncInvocationHandlerDeps()
+    return {
+        requireActiveSession,
+        loadActiveVaultWorkspace,
+        loadVaultMeta,
+        saveVaultMeta,
+        getVaultDir,
+        buildCurrentSanitizedSnapshot: cloudDeps.buildCurrentSanitizedSnapshot,
+        manifestResolver: readMigrationManifest,
+        loadWorkspaceHealthSummary: ({ workspace, vaultDir }) => loadWorkspaceHealthSummary({
+            workspace,
+            vaultDir
+        }),
+        prepareLaunchWorkspaceConfig: prepareLaunchWorkspaceConfigForLaunch,
+        isLaunchActive,
+        launchWorkspace: launchTrustedAutoLaunchWorkspace,
+        verifyMergedPatchAuthor: ({ patchRevisionId }) => verifyTrustedPatchAuthorForAutoLaunch({
+            storage: cloudDeps.storage,
+            firestoreClient: cloudDeps.firestoreClient,
+            patchRevisionId
+        })
+    }
+}
+
 function emitCloudSyncAutoImportStatus(status) {
     for (const win of BrowserWindow.getAllWindows()) {
         try { win.webContents.send('cloud-sync:auto-import-status', status) } catch (_) { }
+    }
+    try {
+        Promise.resolve(trustedAutoLaunch.observeAutoImportStatus(status)).catch(error => {
+            console.warn('[Wipesnap] trusted auto-launch status observation failed:', error?.message || error)
+        })
+    } catch (error) {
+        console.warn('[Wipesnap] trusted auto-launch status observation failed:', error?.message || error)
     }
 }
 
@@ -670,8 +850,15 @@ const cloudSyncAutoImport = createTrustedAutoImportOrchestrator({
     logger: console
 })
 
+const trustedAutoLaunch = createTrustedAutoLaunchOrchestrator({
+    resolveDeps: createTrustedAutoLaunchDeps,
+    onStatus: emitTrustedAutoLaunchStatus,
+    logger: console
+})
+
 function scheduleTrustedAutoImportAfterUnlock() {
     try {
+        trustedAutoLaunch.beginUnlockSession()
         cloudSyncAutoImport.scheduleAfterUnlock()
     } catch (error) {
         console.warn('[Wipesnap] trusted auto-import scheduling failed:', error?.message || error)
@@ -730,6 +917,11 @@ function registerIpcHandlers() {
         deps: createCloudSyncInvocationHandlerDeps
     })
     trustedHandle('cloud-sync:get-auto-import-status', async () => cloudSyncAutoImport.getStatus())
+    trustedHandle('auto-launch:get-status', async () => trustedAutoLaunch.getStatus())
+    trustedHandle('auto-launch:cancel-current-attempt', async () => trustedAutoLaunch.cancelCurrentAttempt())
+    trustedHandle('auto-launch:disable', async () => trustedAutoLaunch.disableAutoLaunch())
+    trustedHandle('auto-launch:update-setting', async (_, input) => trustedAutoLaunch.updateSetting(input))
+    trustedHandle('auto-launch:launch-now', async () => trustedAutoLaunch.launchNow())
     trustedHandle('load-account-slots', async (_, input) => {
         return loadAccountSlotsHandlerCore({
             input,
@@ -776,6 +968,7 @@ function registerIpcHandlers() {
     })
 
     trustedHandle('save-workspace', async (_, workspace) => {
+        trustedAutoLaunch.invalidate('workspace-change')
         return saveWorkspaceHandlerCore({
             workspace,
             state: workspaceCapabilityState,
@@ -784,6 +977,7 @@ function registerIpcHandlers() {
     })
 
     trustedHandle('save-vault', async (_, input) => {
+        trustedAutoLaunch.invalidate('workspace-change')
         return saveVaultHandlerCore({
             input,
             state: workspaceCapabilityState,
@@ -2549,6 +2743,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
     }
 
     trustedHandle('capture-session', async (_, input = {}) => {
+        trustedAutoLaunch.invalidate('session-capture')
         try {
             return await saveSessionCaptureResult({
                 input,
@@ -2574,6 +2769,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
 
     // ─── Save Current Session (without closing browser) ──────────────────
     trustedHandle('save-current-session', async () => {
+        trustedAutoLaunch.invalidate('save-current-session')
         try {
             return await saveSessionCaptureResult({
                 capture: captureCurrentSession,
@@ -2587,6 +2783,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
 
     // ─── Quit & Relaunch ─────────────────────────────────────────────────
     trustedHandle('quit-and-relaunch', async (_, input = {}) => {
+        trustedAutoLaunch.invalidate('quit')
         try {
             return await quitAndRelaunchHandlerCore({
                 input,
@@ -2599,6 +2796,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
 
     // ─── Close Desktop Apps ──────────────────────────────────────────────
     trustedHandle('close-desktop-apps', async () => {
+        trustedAutoLaunch.invalidate('manual-close-desktop-apps')
         return closeDesktopAppsHandlerCore({
             deps: createProcessControlHandlerDeps()
         })
@@ -2606,12 +2804,17 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
 
     // ─── Launch Workspace Engine ─────────────────────────────────────────
     const hostLaunchTypes = ['host-folder', 'registry-uninstall', 'app-paths', 'start-menu-shortcut', 'shell-execute', 'protocol-uri', 'packaged-app']
-    const prepareLaunchWorkspaceConfigForLaunch = async (safeWorkspace) => {
+    prepareLaunchWorkspaceConfigForLaunch = async (safeWorkspace, options = {}) => {
+        const allowLegacyRepair = options.allowLegacyRepair !== false
+        const vaultDir = getVaultDir()
         const launchWorkspaceConfig = {
             ...safeWorkspace,
             desktopApps: (safeWorkspace.desktopApps || []).map((desktopApp) => {
                 try {
                     if (hostLaunchTypes.includes(desktopApp?.launchSourceType)) {
+                        return desktopApp
+                    }
+                    if (!allowLegacyRepair) {
                         return desktopApp
                     }
                     const repair = repairLegacyAppConfig(desktopApp, vaultDir)
@@ -2665,6 +2868,10 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
     }
 
     trustedHandle('launch-workspace', async (event) => {
+        trustedAutoLaunch.invalidate('manual-launch-request')
+        if (isLaunchActive()) {
+            return { success: false, error: 'A workspace launch is already active.' }
+        }
         return launchWorkspaceHandlerCore({
             event,
             deps: {
@@ -2681,6 +2888,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
                 closeDesktopApps,
                 prepareLaunchWorkspaceConfig: prepareLaunchWorkspaceConfigForLaunch,
                 launchWorkspace,
+                onLaunchPromise: trackLaunchPromise,
                 onLaunchError: (err) => diagError('launch-workspace', err.message)
             }
         })
@@ -2688,6 +2896,7 @@ Get-StartApps | Where-Object { $_.Name -and $_.AppID } |
 
     // ─── Window Controls ─────────────────────────────────────────────────
     trustedHandle('close-window', () => {
+        trustedAutoLaunch.invalidate('close-window')
         return closeWindowHandlerCore({
             deps: createProcessControlHandlerDeps()
         })
@@ -2864,6 +3073,7 @@ app.whenReady().then(() => {
 // Phase 14: before-quit with try/finally — guarantees profile sync + cleanup
 let isQuitting = false
 app.on('before-quit', async (e) => {
+    try { trustedAutoLaunch.invalidate('before-quit') } catch (_) { }
     await beforeQuitLifecycleCleanupCore({
         event: e,
         state: {
@@ -2898,5 +3108,6 @@ process.on('exit', () => {
 })
 
 app.on('window-all-closed', () => {
+    try { trustedAutoLaunch.invalidate('close-window') } catch (_) { }
     app.quit()
 })

@@ -3,6 +3,7 @@ import UnlockScreen from './components/UnlockScreen'
 import SetupScreen from './components/SetupScreen'
 import DashboardScreen from './components/DashboardScreen'
 import LaunchingScreen from './components/LaunchingScreen'
+import { autoLaunchFlagForDashboardSave } from './rendererAutoLaunchPolicy'
 
 export default function App() {
     const [screen, setScreen] = useState('loading')
@@ -11,7 +12,7 @@ export default function App() {
     const [workspace, setWorkspace] = useState(null)
     const [vaultMeta, setVaultMeta] = useState(null)
     const [error, setError] = useState(null)
-    const [autoLaunch, setAutoLaunch] = useState(true)
+    const [autoLaunch, setAutoLaunch] = useState(false)
 
     useEffect(() => {
         async function boot() {
@@ -32,6 +33,7 @@ export default function App() {
                     const result = await window.wipesnap.tryFastBoot()
                     if (result.success) {
                         setWorkspace(result.workspace)
+                        setAutoLaunch(false)
                         setScreen('launching')
                         return
                     }
@@ -60,7 +62,7 @@ export default function App() {
 
     const handleUnlock = async (workspace, mp) => {
         setWorkspace(workspace)
-        setAutoLaunch(true) // Always auto-launch from a fresh unlock
+        setAutoLaunch(false)
         setScreen('launching')
     }
 
@@ -77,7 +79,7 @@ export default function App() {
         }
 
         if (forceRelaunch) {
-            setAutoLaunch(true)
+            setAutoLaunch(autoLaunchFlagForDashboardSave({ forceRelaunch }))
             setScreen('launching')
             setPreviousScreen(null)
             return

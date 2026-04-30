@@ -737,8 +737,7 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         const result = await window.wipesnap.captureSession({})
         if (result.success) {
             const newWebTabs = result.urls.map(url => ({ url, enabled: true }))
-            // Jump directly to LaunchingScreen and trigger auto-relaunch
-            onSave(true, { ...workspace, webTabs: newWebTabs })
+            onSave(false, { ...workspace, webTabs: newWebTabs })
         } else {
             setError(result.error || 'Capture failed')
             setSaving(false)

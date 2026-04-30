@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { shouldAutoStartRendererLaunch } from '../rendererAutoLaunchPolicy'
 
 function normalizeStatusMessage(message) {
     return String(message || '')
@@ -56,6 +57,50 @@ function cleanDisplayLabel(item) {
         }
     }
     return item
+}
+
+function safeAutoLaunchText(value, fallback = '') {
+    if (typeof value !== 'string') return fallback
+    const text = value
+        .replace(/[\u0000-\u001F\u007F]/g, ' ')
+        .replace(/https?:\/\/[^\s]+/gi, '[redacted-url]')
+        .replace(/[?#][A-Za-z0-9_=&%.-]+/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+    return text.length > 90 ? `${text.slice(0, 87).trim()}...` : text
+}
+
+function normalizeAutoLaunchStatus(status) {
+    if (!status || typeof status !== 'object' || Array.isArray(status)) {
+        return {
+            statusCategory: 'idle',
+            countdownSeconds: 0,
+            presetLabel: '',
+            itemCounts: { total: 0, browserTabs: 0, desktopApps: 0, hostFolders: 0, accountIntentions: 0, profileIntentions: 0 },
+            blockerReasonCodes: [],
+            recoveryHints: []
+        }
+    }
+    const counts = status.itemCounts && typeof status.itemCounts === 'object' ? status.itemCounts : {}
+    return {
+        statusCategory: safeAutoLaunchText(status.statusCategory || status.status, 'idle'),
+        countdownSeconds: Number.isSafeInteger(status.countdownSeconds) && status.countdownSeconds > 0 ? status.countdownSeconds : 0,
+        presetLabel: safeAutoLaunchText(status.presetLabel, ''),
+        itemCounts: {
+            total: Number.isSafeInteger(counts.total) ? counts.total : 0,
+            browserTabs: Number.isSafeInteger(counts.browserTabs) ? counts.browserTabs : 0,
+            desktopApps: Number.isSafeInteger(counts.desktopApps) ? counts.desktopApps : 0,
+            hostFolders: Number.isSafeInteger(counts.hostFolders) ? counts.hostFolders : 0,
+            accountIntentions: Number.isSafeInteger(counts.accountIntentions) ? counts.accountIntentions : 0,
+            profileIntentions: Number.isSafeInteger(counts.profileIntentions) ? counts.profileIntentions : 0
+        },
+        blockerReasonCodes: Array.isArray(status.blockerReasonCodes)
+            ? status.blockerReasonCodes.slice(0, 5).map(code => safeAutoLaunchText(code, '')).filter(Boolean)
+            : [],
+        recoveryHints: Array.isArray(status.recoveryHints)
+            ? status.recoveryHints.slice(0, 3).map(hint => safeAutoLaunchText(hint, '')).filter(Boolean)
+            : []
+    }
 }
 
 function parseSuccessItem(message) {
@@ -192,7 +237,7 @@ function reconcileFinalNotices(existing, finalLoaded, finalFailed, finalSkipped 
     return existing.filter((notice) => !notice.itemKey || !resolvedKeys.has(notice.itemKey))
 }
 
-export default function LaunchingScreen({ workspace, autoLaunch = true, onSettingsClick }) {
+export default function LaunchingScreen({ workspace, autoLaunch = false, onSettingsClick }) {
     const [phase, setPhase] = useState('launching')
     const [progress, setProgress] = useState(0)
     const [totalItems, setTotalItems] = useState(0)
@@ -205,6 +250,29 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
     const [savingSession, setSavingSession] = useState(false)
     const [saveSuccess, setSaveSuccess] = useState(false)
     const [isClosing, setIsClosing] = useState(false)
+    const [autoLaunchStatus, setAutoLaunchStatus] = useState(() => normalizeAutoLaunchStatus(null))
+
+    const beginWorkspaceLaunch = async () => {
+        if (!workspace) return
+        setLoadedItems([])
+        setFailedItems([])
+        setSkippedItems([])
+        setNotices([])
+        setLiveStatus('Preparing workspace...')
+        setErrorMsg(null)
+        setProgress(0)
+        setPhase('launching')
+        try {
+            const result = await window.wipesnap.launchWorkspace(workspace)
+            if (result && result.success === false) {
+                setPhase('error')
+                setErrorMsg(result.error || 'Workspace launch could not start.')
+            }
+        } catch (err) {
+            setPhase('error')
+            setErrorMsg(err.message)
+        }
+    }
 
     useEffect(() => {
         setLoadedItems([])
@@ -233,18 +301,10 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
         const enabledApps = workspace.desktopApps?.filter((a) => a.enabled) || []
         const total = enabledTabs.length + enabledApps.length
 
-        if (total === 0) {
-            setPhase('ready')
-            setProgress(100)
-            return
-        }
-
         setTotalItems(total)
-
-        if (!autoLaunch) {
+        if (total === 0 || !autoLaunch) {
             setPhase('ready')
             setProgress(100)
-            return
         }
 
         const cleanupStatus = window.wipesnap.onLaunchStatus((rawMessage) => {
@@ -286,6 +346,17 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
             if (!result.success) {
                 setPhase('error')
                 setErrorMsg(result.error)
+                return
+            }
+
+            if (result.results?.metadataOnly === true) {
+                setLoadedItems([])
+                setFailedItems([])
+                setSkippedItems([])
+                setNotices([])
+                setPhase('ready')
+                setProgress(100)
+                setLiveStatus('Workspace launch complete.')
                 return
             }
 
@@ -334,16 +405,39 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
             )
         })
 
-        window.wipesnap.launchWorkspace(workspace).catch((err) => {
-            setPhase('error')
-            setErrorMsg(err.message)
-        })
+        if (shouldAutoStartRendererLaunch({ autoLaunch, total })) {
+            beginWorkspaceLaunch()
+        }
 
         return () => {
             cleanupStatus()
             cleanupComplete()
         }
     }, [workspace, autoLaunch])
+
+    useEffect(() => {
+        if (!window.wipesnap.autoLaunch) return undefined
+        let active = true
+        const applyStatus = (status) => {
+            if (!active) return
+            const safeStatus = normalizeAutoLaunchStatus(status)
+            setAutoLaunchStatus(safeStatus)
+            if (safeStatus.statusCategory === 'launching') {
+                setPhase('launching')
+                setLiveStatus('Trusted auto-launch started.')
+                if (safeStatus.itemCounts.total > 0) setTotalItems(safeStatus.itemCounts.total)
+            }
+            if (safeStatus.statusCategory === 'countdown' && safeStatus.itemCounts.total > 0) {
+                setTotalItems(safeStatus.itemCounts.total)
+            }
+        }
+        window.wipesnap.autoLaunch.getStatus().then(applyStatus).catch(() => {})
+        const cleanup = window.wipesnap.autoLaunch.onStatus(applyStatus)
+        return () => {
+            active = false
+            cleanup()
+        }
+    }, [])
 
     const handleSaveSession = async () => {
         setSavingSession(true)
@@ -365,6 +459,32 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
         window.wipesnap.close()
     }
 
+    const handleCancelAutoLaunch = async () => {
+        try {
+            const status = await window.wipesnap.autoLaunch?.cancelCurrentAttempt()
+            setAutoLaunchStatus(normalizeAutoLaunchStatus(status))
+        } catch (_) { }
+    }
+
+    const handleDisableAutoLaunch = async () => {
+        try {
+            const status = await window.wipesnap.autoLaunch?.disable()
+            setAutoLaunchStatus(normalizeAutoLaunchStatus(status))
+        } catch (_) { }
+    }
+
+    const handleAutoLaunchNow = async () => {
+        try {
+            setPhase('launching')
+            setLiveStatus('Preparing trusted auto-launch...')
+            const result = await window.wipesnap.autoLaunch?.launchNow()
+            if (result?.status) setAutoLaunchStatus(normalizeAutoLaunchStatus(result.status))
+        } catch (err) {
+            setPhase('error')
+            setErrorMsg(err.message)
+        }
+    }
+
     const statusSummary = useMemo(() => {
         if (failedItems.length > 0) {
             return `${loadedItems.length} loaded, ${failedItems.length} failed${skippedItems.length > 0 ? `, ${skippedItems.length} skipped` : ''}`
@@ -383,6 +503,10 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
             : loadedItems.length > 0
                 ? `${loadedItems.length} item${loadedItems.length !== 1 ? 's' : ''} launched`
                 : 'All set'
+
+    const showAutoLaunchCountdown = autoLaunchStatus.statusCategory === 'countdown'
+    const showAutoLaunchBlocked = autoLaunchStatus.statusCategory === 'blocked' &&
+        autoLaunchStatus.blockerReasonCodes.length > 0
 
     return (
         <>
@@ -578,9 +702,61 @@ export default function LaunchingScreen({ workspace, autoLaunch = true, onSettin
                             </div>
                         )}
 
+                        {showAutoLaunchCountdown && (
+                            <div className="mb-4 p-3 rounded-lg bg-[#121626] border border-[#27304d]">
+                                <div className="flex items-start justify-between gap-3 mb-2">
+                                    <div className="min-w-0">
+                                        <p className="text-xs font-medium text-white">Trusted auto-launch</p>
+                                        <p className="text-[10px] text-[#aab7e8] truncate">
+                                            {autoLaunchStatus.presetLabel || 'Selected preset'}
+                                        </p>
+                                    </div>
+                                    <div className="text-right flex-shrink-0">
+                                        <p className="text-base font-semibold text-white">{autoLaunchStatus.countdownSeconds}</p>
+                                        <p className="text-[9px] text-[#8793c2]">sec</p>
+                                    </div>
+                                </div>
+                                <p className="text-[10px] text-[#9ca3c8] mb-3">
+                                    {autoLaunchStatus.itemCounts.total} items: {autoLaunchStatus.itemCounts.browserTabs} tabs, {autoLaunchStatus.itemCounts.desktopApps + autoLaunchStatus.itemCounts.hostFolders} desktop
+                                </p>
+                                <div className="grid grid-cols-3 gap-2">
+                                    <button className="btn-secondary text-[10px] py-1.5" onClick={handleCancelAutoLaunch}>
+                                        Cancel
+                                    </button>
+                                    <button className="btn-primary text-[10px] py-1.5" onClick={handleAutoLaunchNow}>
+                                        Launch now
+                                    </button>
+                                    <button className="text-[10px] py-1.5 rounded-md border border-[#3a2a2a] text-[#d44] hover:bg-[#2a1a1a] transition-colors" onClick={handleDisableAutoLaunch}>
+                                        Disable
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+
+                        {showAutoLaunchBlocked && (
+                            <div className="mb-4 p-3 rounded-lg bg-[#1b1718] border border-[#3a2a2a]">
+                                <p className="text-xs font-medium text-[#f0b36b] mb-1">Auto-launch blocked</p>
+                                <p className="text-[10px] text-[#c08e86] break-words">
+                                    {autoLaunchStatus.blockerReasonCodes.join(', ')}
+                                </p>
+                                {autoLaunchStatus.recoveryHints[0] && (
+                                    <p className="text-[10px] text-[#9ca3c8] mt-1">{autoLaunchStatus.recoveryHints[0]}</p>
+                                )}
+                            </div>
+                        )}
+
                         <div className="space-y-2">
+                            {totalItems > 0 && loadedItems.length === 0 && failedItems.length === 0 && skippedItems.length === 0 && (
+                                <button
+                                    className="btn-primary w-full text-sm py-2.5"
+                                    onClick={beginWorkspaceLaunch}
+                                >
+                                    Launch Workspace
+                                </button>
+                            )}
+
                             <button
-                                className="btn-primary w-full text-sm py-2.5"
+                                className={`${totalItems > 0 && loadedItems.length === 0 && failedItems.length === 0 && skippedItems.length === 0 ? 'btn-secondary' : 'btn-primary'} w-full text-sm py-2.5`}
                                 disabled={savingSession}
                                 onClick={handleSaveSession}
                             >

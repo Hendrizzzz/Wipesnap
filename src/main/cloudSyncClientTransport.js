@@ -324,6 +324,48 @@ async function trustedPatchAuthorSummary(firestoreClient, state, envelope) {
     }
 }
 
+export async function verifyTrustedPatchAuthorForAutoLaunch({
+    storage,
+    firestoreClient,
+    patchRevisionId
+} = {}) {
+    try {
+        if (!storage || typeof storage.loadAfterUnlock !== 'function') {
+            fail('Trusted auto-launch requires unlocked desktop cloud sync storage.')
+        }
+        if (typeof patchRevisionId !== 'string' || !/^patchrev_[A-Za-z0-9_-]{1,120}$/.test(patchRevisionId.trim())) {
+            return { trusted: false, reason: 'invalid-patch', metadataOnly: true }
+        }
+        const state = normalizeDeviceState(await storage.loadAfterUnlock(), 'desktop', 'desktop cloud sync state')
+        const rawEnvelope = await getCloudDocument(firestoreClient, `users/${state.ownerUid}/patches/${patchRevisionId.trim()}`)
+        if (!rawEnvelope) return { trusted: false, reason: 'not-found', metadataOnly: true }
+        const envelope = validateCloudSyncEnvelope(envelopeWithoutBackendIngestionMetadata(rawEnvelope), {
+            expectedDocType: CLOUD_SYNC_PATCH_DOC_TYPE,
+            activeKeyVersion: state.device.keyVersion
+        })
+        if (envelope.revisionId !== patchRevisionId.trim()) {
+            return { trusted: false, reason: 'invalid-patch', metadataOnly: true }
+        }
+        requireTrustedPatchAuthorDevice(
+            await getTrustedDeviceRecord(firestoreClient, state.ownerUid, envelope.deviceId),
+            state,
+            envelope
+        )
+        return { trusted: true, metadataOnly: true }
+    } catch (error) {
+        const code = error?.code
+        if (code === 'revoked-device') return { trusted: false, reason: 'revoked-device', metadataOnly: true }
+        if (code === 'invalid-key') return { trusted: false, reason: 'invalid-key', metadataOnly: true }
+        if (code === 'invalid-author-device') return { trusted: false, reason: 'untrusted-author', metadataOnly: true }
+        const classified = classifyPatchApplyError(error)
+        return {
+            trusted: false,
+            reason: classified.reason || 'invalid-patch',
+            metadataOnly: true
+        }
+    }
+}
+
 function requireActiveVaultSessionForTrustedPatchApply(deps) {
     if (!deps || typeof deps.requireActiveSession !== 'function') {
         fail('Trusted cloud patch apply requires requireActiveSession.')

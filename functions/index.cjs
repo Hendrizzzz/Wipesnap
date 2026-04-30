@@ -156,6 +156,24 @@ exports.approveCloudSyncKeyGrant = onCall({ region: 'us-central1' }, async reque
     )
 })
 
+exports.recordCloudSyncPatchApplyDecision = onCall({ region: 'us-central1' }, async request => {
+    const { recordCloudSyncPatchApplyDecision } = await import('./shared/main/cloudSyncIngestion.js')
+    return mapCloudSyncErrors(async () =>
+        recordCloudSyncPatchApplyDecision({
+            auth: request.auth
+                ? { uid: request.auth.uid, token: request.auth.token || {} }
+                : null,
+            documentId: request.data?.documentId,
+            document: request.data?.document,
+            signature: request.data?.signature,
+            deviceSequence: request.data?.deviceSequence,
+            requestedAt: request.data?.requestedAt,
+            store: await adminStore(),
+            now: Date.now()
+        })
+    )
+})
+
 exports.revokeCloudSyncDevice = onCall({ region: 'us-central1' }, async request => {
     const { revokeCloudSyncDevice } = await import('./shared/main/cloudSyncIngestion.js')
     return mapCloudSyncErrors(async () =>

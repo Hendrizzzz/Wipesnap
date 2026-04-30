@@ -21,7 +21,8 @@ export const CLOUD_SYNC_INGESTION_OPERATIONS = Object.freeze({
     deviceRecord: 'device-record',
     keyGrant: 'key-grant',
     snapshotEnvelope: 'snapshot-envelope',
-    patchEnvelope: 'patch-envelope'
+    patchEnvelope: 'patch-envelope',
+    patchApplyDecision: 'patch-apply-decision'
 })
 export const CLOUD_SYNC_ADMIN_OPERATIONS = Object.freeze({
     bootstrapDesktopDevice: 'bootstrap-desktop-device',
@@ -30,14 +31,52 @@ export const CLOUD_SYNC_ADMIN_OPERATIONS = Object.freeze({
     claimDeviceSession: 'claim-device-session',
     revokeDevice: 'revoke-device'
 })
+export const CLOUD_SYNC_PATCH_APPLY_DECISION_RECORD_TYPE = 'cloud-sync-patch-apply-decision'
 
 const DEVICE_ROLES = new Set(['desktop', 'phone', 'web-planner'])
 const DEVICE_ID_PATTERN = /^dev_[A-Za-z0-9_-]{1,92}$/
 const OWNER_UID_PATTERN = /^[A-Za-z0-9:_-]{1,128}$/
 const GRANT_ID_PATTERN = /^grant_[A-Za-z0-9_-]{1,90}$/
+const PATCH_ID_PATTERN = /^patch_[A-Za-z0-9_-]{1,88}$/
+const PATCH_REVISION_ID_PATTERN = /^patchrev_[A-Za-z0-9_-]{1,85}$/
+const SNAPSHOT_REVISION_ID_PATTERN = /^srev_[A-Za-z0-9_-]{1,90}$/
 const PAIRING_CHALLENGE_PATTERN = /^[A-Za-z0-9_-]{16,128}$/
 const HASH_PATTERN = /^[A-Za-z0-9_-]{32,128}$/
 const MAX_TIMESTAMP = 8_640_000_000_000_000
+const PATCH_APPLY_DECISION_STATUSES = new Set(['applied', 'conflict', 'skipped'])
+const PATCH_APPLY_DECISION_REASONS = new Set([
+    'merged',
+    'stale-base',
+    'parallel-patch',
+    'revoked-device',
+    'invalid-envelope',
+    'invalid-signature',
+    'invalid-key',
+    'unknown-safe-id',
+    'unknown-safe-preset',
+    'duplicate-patch',
+    'forbidden-material',
+    'schema-rejected',
+    'merge-rejected',
+    'cloud-conflict'
+])
+const PATCH_APPLY_DECISION_KEYS = new Set([
+    'product',
+    'recordType',
+    'schemaVersion',
+    'ownerUid',
+    'patchId',
+    'patchRevisionId',
+    'baseSnapshotRevisionId',
+    'currentSnapshotRevisionId',
+    'sourcePatchDeviceId',
+    'desktopDeviceId',
+    'status',
+    'reason',
+    'decidedAt',
+    'mergeStatus',
+    'metadataOnly'
+])
 
 export class CloudSyncIngestionError extends Error {
     constructor(code, message) {
@@ -89,6 +128,24 @@ function normalizeDeviceId(value, fieldName = 'deviceId') {
 function normalizeGrantId(value, fieldName = 'grantId') {
     const text = normalizeString(value, fieldName, { max: 96 })
     if (!GRANT_ID_PATTERN.test(text)) fail('invalid-argument', `${fieldName} must be a safe key grant id.`)
+    return text
+}
+
+function normalizePatchId(value, fieldName = 'patchId') {
+    const text = normalizeString(value, fieldName, { max: 96 })
+    if (!PATCH_ID_PATTERN.test(text)) fail('invalid-argument', `${fieldName} must be a safe patch id.`)
+    return text
+}
+
+function normalizePatchRevisionId(value, fieldName = 'patchRevisionId') {
+    const text = normalizeString(value, fieldName, { max: 96 })
+    if (!PATCH_REVISION_ID_PATTERN.test(text)) fail('invalid-argument', `${fieldName} must be a safe patch revision id.`)
+    return text
+}
+
+function normalizeSnapshotRevisionId(value, fieldName = 'snapshotRevisionId') {
+    const text = normalizeString(value, fieldName, { max: 96 })
+    if (!SNAPSHOT_REVISION_ID_PATTERN.test(text)) fail('invalid-argument', `${fieldName} must be a safe snapshot revision id.`)
     return text
 }
 
@@ -228,6 +285,92 @@ export function createCloudSyncDeviceSessionClaimDocument({
         deviceId: normalizeDeviceId(deviceId, 'deviceId'),
         keyGrantId: normalizeGrantId(keyGrantId, 'keyGrantId'),
         pairingChallengeHash: normalizeHash(pairingChallengeHash, 'pairingChallengeHash')
+    }
+}
+
+function rejectUnknownPatchApplyDecisionKeys(value) {
+    for (const key of Object.keys(value || {})) {
+        if (!PATCH_APPLY_DECISION_KEYS.has(key)) {
+            fail('invalid-argument', `cloud sync patch apply decision.${key} is not supported.`)
+        }
+    }
+}
+
+function normalizeOptionalPatchId(value, fieldName) {
+    if (value == null || value === '') return null
+    return normalizePatchId(value, fieldName)
+}
+
+function normalizeOptionalSnapshotRevisionId(value, fieldName) {
+    if (value == null || value === '') return null
+    return normalizeSnapshotRevisionId(value, fieldName)
+}
+
+function normalizePatchApplyDecisionStatus(value) {
+    const status = normalizeString(value, 'cloud sync patch apply decision.status', { max: 40 })
+    if (!PATCH_APPLY_DECISION_STATUSES.has(status)) {
+        fail('invalid-argument', 'cloud sync patch apply decision.status is not supported.')
+    }
+    return status
+}
+
+function normalizePatchApplyDecisionReason(value) {
+    const reason = normalizeString(value, 'cloud sync patch apply decision.reason', { max: 40 })
+    if (!PATCH_APPLY_DECISION_REASONS.has(reason)) {
+        fail('invalid-argument', 'cloud sync patch apply decision.reason is not supported.')
+    }
+    return reason
+}
+
+function normalizePatchApplyMergeStatus(value) {
+    if (value == null || value === '') return ''
+    return normalizeString(value, 'cloud sync patch apply decision.mergeStatus', { max: 40 })
+}
+
+export function validateCloudSyncPatchApplyDecisionRecord(input) {
+    if (!isPlainObject(input)) fail('invalid-argument', 'cloud sync patch apply decision must be an object.')
+    assertNoForbiddenCloudSyncBackendPlaintext(input)
+    rejectUnknownPatchApplyDecisionKeys(input)
+    if (input.product !== 'wipesnap') fail('invalid-argument', 'cloud sync patch apply decision.product is not supported.')
+    if (input.recordType !== CLOUD_SYNC_PATCH_APPLY_DECISION_RECORD_TYPE) {
+        fail('invalid-argument', 'cloud sync patch apply decision.recordType is not supported.')
+    }
+    if (input.schemaVersion !== CLOUD_SYNC_INGESTION_SCHEMA_VERSION) {
+        fail('invalid-argument', 'cloud sync patch apply decision.schemaVersion is not supported.')
+    }
+    if (input.metadataOnly !== true) {
+        fail('invalid-argument', 'cloud sync patch apply decision.metadataOnly must be true.')
+    }
+    const status = normalizePatchApplyDecisionStatus(input.status)
+    const reason = normalizePatchApplyDecisionReason(input.reason)
+    if (status === 'applied' && reason !== 'merged') {
+        fail('invalid-argument', 'applied cloud sync patch decisions require merged reason.')
+    }
+    if (status !== 'applied' && reason === 'merged') {
+        fail('invalid-argument', 'merged reason is only valid for applied cloud sync patch decisions.')
+    }
+    return {
+        product: 'wipesnap',
+        recordType: CLOUD_SYNC_PATCH_APPLY_DECISION_RECORD_TYPE,
+        schemaVersion: CLOUD_SYNC_INGESTION_SCHEMA_VERSION,
+        ownerUid: normalizeOwnerUid(input.ownerUid, 'cloud sync patch apply decision.ownerUid'),
+        patchId: normalizeOptionalPatchId(input.patchId, 'cloud sync patch apply decision.patchId'),
+        patchRevisionId: normalizePatchRevisionId(input.patchRevisionId, 'cloud sync patch apply decision.patchRevisionId'),
+        baseSnapshotRevisionId: normalizeOptionalSnapshotRevisionId(
+            input.baseSnapshotRevisionId,
+            'cloud sync patch apply decision.baseSnapshotRevisionId'
+        ),
+        currentSnapshotRevisionId: normalizeOptionalSnapshotRevisionId(
+            input.currentSnapshotRevisionId,
+            'cloud sync patch apply decision.currentSnapshotRevisionId'
+        ),
+        sourcePatchDeviceId: normalizeDeviceId(input.sourcePatchDeviceId, 'cloud sync patch apply decision.sourcePatchDeviceId'),
+        desktopDeviceId: normalizeDeviceId(input.desktopDeviceId, 'cloud sync patch apply decision.desktopDeviceId'),
+        status,
+        reason,
+        decidedAt: normalizeTimestamp(input.decidedAt, 'cloud sync patch apply decision.decidedAt'),
+        mergeStatus: normalizePatchApplyMergeStatus(input.mergeStatus),
+        metadataOnly: true
     }
 }
 
@@ -657,6 +800,127 @@ async function ingestKeyGrant({
     return { status: 'accepted', path: grantPath, grantId: keyGrant.grantId }
 }
 
+function validateStoredPatchEnvelopeForApply(rawPatch, authContext) {
+    assertNoForbiddenCloudSyncBackendPlaintext(rawPatch)
+    if (rawPatch?.apply != null) validateCloudSyncPatchApplyDecisionRecord(rawPatch.apply)
+    const envelopeInput = clone(rawPatch)
+    delete envelopeInput.ingestion
+    delete envelopeInput.apply
+    let envelope
+    try {
+        envelope = validateCloudSyncEnvelope(envelopeInput, {
+            expectedDocType: CLOUD_SYNC_PATCH_DOC_TYPE,
+            activeKeyVersion: authContext.keyVersion
+        })
+    } catch (error) {
+        invalidArgumentFrom(error)
+    }
+    if (envelope.ownerUid !== authContext.uid) fail('permission-denied', 'Cloud sync patch owner does not match caller.')
+    return envelope
+}
+
+function validatePatchSourceDeviceForApply(rawDevice, envelope, decision) {
+    if (!rawDevice) fail('failed-precondition', 'Cloud sync patch author device is not enrolled.')
+    let sourceDevice
+    try {
+        sourceDevice = validateCloudSyncDeviceRecord(rawDevice)
+    } catch (error) {
+        fail('failed-precondition', error.message || 'Cloud sync patch author device record is invalid.')
+    }
+    if (sourceDevice.ownerUid !== envelope.ownerUid || sourceDevice.deviceId !== envelope.deviceId) {
+        fail('permission-denied', 'Cloud sync patch author device does not match the patch envelope.')
+    }
+    if (!['phone', 'web-planner'].includes(sourceDevice.role)) {
+        fail('permission-denied', 'Cloud sync patch author must be a phone or web planner device.')
+    }
+    if (sourceDevice.keyVersion !== envelope.keyVersion) {
+        fail('permission-denied', 'Cloud sync patch author key version is stale.')
+    }
+    if (!Array.isArray(sourceDevice.syncScopes) || !sourceDevice.syncScopes.includes('patch-upload')) {
+        fail('permission-denied', 'Cloud sync patch author device lacks patch upload scope.')
+    }
+
+    const sourceRevoked = sourceDevice.status !== 'active' || sourceDevice.revokedAt != null
+    if (decision.status === 'applied') {
+        if (sourceRevoked) fail('permission-denied', 'Cloud sync patch author device is revoked.')
+        verifyEnvelopeSignatureForDevice(envelope, sourceDevice)
+    }
+    return sourceDevice
+}
+
+async function recordPatchApplyDecision({
+    tx,
+    authContext,
+    documentId,
+    document,
+    signature,
+    requestedAt,
+    deviceSequence,
+    now,
+    rateLimit
+}) {
+    const { path: devicePath, device } = await requireExistingActiveDesktop(tx, authContext)
+    assertMonotonicDeviceSequence(device, deviceSequence)
+    const decision = validateCloudSyncPatchApplyDecisionRecord(document)
+    if (decision.ownerUid !== authContext.uid) fail('permission-denied', 'Patch apply decision owner does not match caller.')
+    if (decision.patchRevisionId !== documentId) fail('invalid-argument', 'Patch apply decision revision id must match documentId.')
+    if (decision.desktopDeviceId !== authContext.deviceId) {
+        fail('permission-denied', 'Patch apply decision desktop device must match caller.')
+    }
+
+    const patchPath = userPath(authContext.uid, 'patches', decision.patchRevisionId)
+    const rawPatch = await tx.get(patchPath)
+    if (!rawPatch) fail('failed-precondition', 'Cloud sync patch does not exist.')
+    if (rawPatch.apply != null) fail('already-exists', 'Cloud sync patch already has an apply decision.')
+    const envelope = validateStoredPatchEnvelopeForApply(rawPatch, authContext)
+    if (decision.patchId !== envelope.patchId) fail('invalid-argument', 'Patch apply decision patch id does not match patch envelope.')
+    if (decision.baseSnapshotRevisionId && decision.baseSnapshotRevisionId !== envelope.baseRevisionId) {
+        fail('invalid-argument', 'Patch apply decision base snapshot does not match patch envelope.')
+    }
+    if (decision.sourcePatchDeviceId !== envelope.deviceId) {
+        fail('invalid-argument', 'Patch apply decision source device does not match patch envelope.')
+    }
+    const sourceDevice = await tx.get(userPath(authContext.uid, 'devices', envelope.deviceId))
+    validatePatchSourceDeviceForApply(sourceDevice, envelope, decision)
+    verifyDetachedIngestionSignature({
+        authContext,
+        device,
+        operation: CLOUD_SYNC_INGESTION_OPERATIONS.patchApplyDecision,
+        documentId,
+        document: decision,
+        deviceSequence,
+        requestedAt,
+        signature
+    })
+
+    await enforceReplayAndRateLimit(tx, {
+        authContext,
+        deviceSequence,
+        operation: CLOUD_SYNC_INGESTION_OPERATIONS.patchApplyDecision,
+        documentId: decision.patchRevisionId,
+        now,
+        rateLimit
+    })
+    const ingestion = {
+        ...(isPlainObject(rawPatch.ingestion) ? rawPatch.ingestion : {}),
+        pending: false,
+        patchApplyStatus: decision.status,
+        patchApplyReason: decision.reason,
+        patchApplyDecidedAt: now,
+        patchApplyDeviceId: authContext.deviceId
+    }
+    const update = { apply: decision, ingestion }
+    assertNoForbiddenCloudSyncBackendPlaintext({ ...rawPatch, ...update })
+    await tx.update(patchPath, update)
+    await updateDeviceSequence(tx, devicePath, device, deviceSequence, now)
+    return {
+        status: decision.status,
+        reason: decision.reason,
+        path: patchPath,
+        revisionId: decision.patchRevisionId
+    }
+}
+
 async function ingestDeviceRecord({
     tx,
     authContext,
@@ -749,6 +1013,20 @@ export async function ingestCloudSyncDocument(input = {}) {
             if (operation === CLOUD_SYNC_INGESTION_OPERATIONS.keyGrant) {
                 if (deviceSequence == null) fail('invalid-argument', 'deviceSequence is required for key grant ingestion.')
                 return ingestKeyGrant({
+                    tx,
+                    authContext,
+                    documentId,
+                    document,
+                    signature: input.signature,
+                    requestedAt,
+                    deviceSequence,
+                    now,
+                    rateLimit
+                })
+            }
+            if (operation === CLOUD_SYNC_INGESTION_OPERATIONS.patchApplyDecision) {
+                if (deviceSequence == null) fail('invalid-argument', 'deviceSequence is required for patch apply decisions.')
+                return recordPatchApplyDecision({
                     tx,
                     authContext,
                     documentId,
@@ -1248,6 +1526,13 @@ export async function approveCloudSyncKeyGrant(input = {}) {
     return ingestCloudSyncDocument({
         ...input,
         operation: CLOUD_SYNC_INGESTION_OPERATIONS.keyGrant
+    })
+}
+
+export async function recordCloudSyncPatchApplyDecision(input = {}) {
+    return ingestCloudSyncDocument({
+        ...input,
+        operation: CLOUD_SYNC_INGESTION_OPERATIONS.patchApplyDecision
     })
 }
 

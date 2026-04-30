@@ -20,6 +20,7 @@ import {
     redactCloudSyncClientLogValue
 } from '../src/main/cloudSyncClientStorage.js'
 import {
+    applyTrustedCloudSafePresetPatchesAfterUnlock,
     downloadDesktopPatchPlans,
     downloadPhoneLatestSnapshot,
     exchangeDeviceSessionTokenMemoryOnly,
@@ -27,6 +28,7 @@ import {
     uploadPhoneSafePresetPatch
 } from '../src/main/cloudSyncClientTransport.js'
 import { SANITIZED_PRESET_SNAPSHOT_LIMITS } from '../src/main/sanitizedPresetSnapshot.js'
+import { WORKSPACE_CAPABILITY_VAULT_KEY } from '../src/main/workspaceCapabilityMigration.js'
 
 const UID = 'firebase_uid_phase21_7'
 const NOW = 1770000000000
@@ -38,6 +40,10 @@ function clone(value) {
 
 function sha256Base64Url(bytes) {
     return createHash('sha256').update(bytes).digest('base64url')
+}
+
+function tamperBase64Url(value) {
+    return `${value[0] === 'A' ? 'B' : 'A'}${value.slice(1)}`
 }
 
 function signingKeyPair() {
@@ -169,6 +175,68 @@ function patchFixture({ authorDeviceId, baseSnapshotRevisionId }) {
             metadataOnly: true
         }],
         newBrowserItems: []
+    }
+}
+
+function workspaceFixture() {
+    return {
+        name: 'Coding',
+        webTabs: [{
+            id: 'raw_ai_studio',
+            url: 'https://aistudio.google.com/',
+            label: 'AI Studio',
+            enabled: true
+        }],
+        desktopApps: [],
+        [WORKSPACE_CAPABILITY_VAULT_KEY]: {
+            version: 1,
+            records: {
+                cap_phase23_sentinel: {
+                    capabilityId: 'cap_phase23_sentinel',
+                    displayName: 'Sentinel'
+                }
+            }
+        }
+    }
+}
+
+function createMergeDeps(workspace, {
+    unlocked = true,
+    failCommit = false,
+    onCommit = () => {}
+} = {}) {
+    let storedWorkspace = clone(workspace)
+    let meta = { version: '1.0.0' }
+    const calls = {
+        commits: 0,
+        launchAttempts: 0
+    }
+    const deps = {
+        requireActiveSession: () => {
+            if (!unlocked) throw new Error('Session is locked')
+        },
+        loadActiveVaultWorkspace: () => clone(storedWorkspace),
+        loadVaultMeta: () => clone(meta),
+        getDriveInfo: async () => ({ driveType: 2, serialNumber: 'USB1234', isRemovable: true }),
+        getActiveMasterPassword: () => 'active-password',
+        encryptVault: (payload, password, isHardwareBound) => ({
+            payload: clone(payload),
+            password,
+            isHardwareBound
+        }),
+        commitVaultMeta: ({ vault, meta: nextMeta, operation }) => {
+            calls.commits += 1
+            onCommit({ vault: clone(vault), meta: clone(nextMeta), operation })
+            if (failCommit) throw new Error('transaction failed')
+            storedWorkspace = clone(vault.payload)
+            meta = clone(nextMeta)
+        },
+        honeyToken: { marker: true }
+    }
+    return {
+        calls,
+        deps,
+        storedWorkspace: () => clone(storedWorkspace)
     }
 }
 
@@ -498,4 +566,494 @@ test('client transport uploads encrypted snapshots, phone patches offline, and d
     assert.equal(plans.plans[0].importPlan.sideEffects.launches, false)
     assert.equal(plans.sideEffects.mergesPatch, false)
     assert.equal(plans.plans[0].importPlan.presetPlans[0].next.name, 'Coding Phone')
+})
+
+test('trusted cloud patch apply validates after unlock, merges through vault transaction, and records backend-safe decisions', async () => {
+    const store = new InMemoryFirestore()
+    const desktopKeys = signingKeyPair()
+    const phoneKeys = signingKeyPair()
+    const desktop = deviceRecord({
+        deviceId: 'dev_desktop_phase23_7',
+        role: 'desktop',
+        syncScopes: ['read', 'snapshot-upload'],
+        keys: desktopKeys
+    })
+    const phone = deviceRecord({
+        deviceId: 'dev_phone_phase23_7',
+        role: 'phone',
+        syncScopes: ['read', 'patch-upload'],
+        keys: phoneKeys
+    })
+    store.seed(`users/${UID}/devices/${desktop.deviceId}`, desktop)
+    store.seed(`users/${UID}/devices/${phone.deviceId}`, phone)
+
+    let desktopState = {
+        ownerUid: UID,
+        device: desktop,
+        syncRootKey: SYNC_ROOT_KEY,
+        signingPrivateKey: desktopKeys.privateKey
+    }
+    const desktopStorage = createDesktopCloudSyncStorage({
+        vaultAdapter: {
+            isUnlocked: () => true,
+            loadCloudSyncState: () => desktopState,
+            saveCloudSyncState: state => {
+                desktopState = state
+            },
+            updateCloudSyncDeviceSequence: sequence => {
+                desktopState = {
+                    ...desktopState,
+                    device: { ...desktopState.device, deviceSequence: sequence }
+                }
+            }
+        }
+    })
+    let phoneState = {
+        ownerUid: UID,
+        device: phone,
+        syncRootKey: SYNC_ROOT_KEY,
+        signingPrivateKey: phoneKeys.privateKey
+    }
+    const phoneStorage = {
+        loadSessionState: () => Promise.resolve(phoneState),
+        cacheEncryptedPatchEnvelope: () => Promise.resolve(),
+        updateDeviceSequence: sequence => {
+            phoneState = { ...phoneState, device: { ...phoneState.device, deviceSequence: sequence } }
+            return Promise.resolve()
+        }
+    }
+    const firestoreClient = {
+        getDocument: path => Promise.resolve(store.get(path)),
+        listDocuments: path => Promise.resolve(store.list(path))
+    }
+    const functionsClient = {
+        callCloudSyncFunction(name, data) {
+            if (name === 'ingestCloudSyncDocument') {
+                const authDevice = data.operation === CLOUD_SYNC_INGESTION_OPERATIONS.snapshotEnvelope
+                    ? desktopState.device
+                    : phoneState.device
+                return ingestCloudSyncDocument({
+                    store,
+                    auth: authFor(authDevice),
+                    operation: data.operation,
+                    documentId: data.documentId,
+                    document: data.document,
+                    requestedAt: NOW,
+                    now: NOW + 100
+                })
+            }
+            if (name === 'recordCloudSyncPatchApplyDecision') {
+                return ingestCloudSyncDocument({
+                    store,
+                    auth: authFor(desktopState.device),
+                    operation: CLOUD_SYNC_INGESTION_OPERATIONS.patchApplyDecision,
+                    documentId: data.documentId,
+                    document: data.document,
+                    signature: data.signature,
+                    deviceSequence: data.deviceSequence,
+                    requestedAt: data.requestedAt,
+                    now: NOW + 200
+                })
+            }
+            throw new Error(`Unexpected function ${name}`)
+        }
+    }
+
+    const snapshot = snapshotFixture({
+        sourceDeviceId: desktop.deviceId,
+        revisionId: 'srev_phase23_7_snapshot_1'
+    })
+    await uploadDesktopSanitizedSnapshot({
+        storage: desktopStorage,
+        functionsClient,
+        snapshot,
+        now: NOW
+    })
+    const validPatchUpload = await uploadPhoneSafePresetPatch({
+        storage: phoneStorage,
+        functionsClient,
+        baseSnapshot: snapshot,
+        patch: patchFixture({
+            authorDeviceId: phone.deviceId,
+            baseSnapshotRevisionId: snapshot.revisionId
+        }),
+        now: NOW + 1
+    })
+    const workspace = workspaceFixture()
+    const originalCapabilityVault = clone(workspace[WORKSPACE_CAPABILITY_VAULT_KEY])
+    const mergeHarness = createMergeDeps(workspace)
+    let snapshotBuilds = 0
+
+    const applied = await applyTrustedCloudSafePresetPatchesAfterUnlock({
+        storage: desktopStorage,
+        firestoreClient,
+        functionsClient,
+        deps: mergeHarness.deps,
+        snapshotBuilder: () => {
+            snapshotBuilds += 1
+            return snapshot
+        },
+        patchRevisionIds: [validPatchUpload.patchRevisionId],
+        now: NOW + 2
+    })
+
+    assert.equal(applied.status, 'completed')
+    assert.equal(applied.summary.applied, 1)
+    assert.equal(applied.records[0].status, 'applied')
+    assert.equal(applied.records[0].cloudStatus.status, 'applied')
+    assert.equal(applied.sideEffects.writesVault, true)
+    assert.equal(applied.sideEffects.launches, false)
+    assert.equal(snapshotBuilds, 1)
+    assert.equal(mergeHarness.calls.commits, 1)
+    assert.deepEqual(mergeHarness.storedWorkspace()[WORKSPACE_CAPABILITY_VAULT_KEY], originalCapabilityVault)
+    const appliedBackendPatch = store.get(`users/${UID}/patches/${validPatchUpload.patchRevisionId}`)
+    assert.equal(appliedBackendPatch.apply.status, 'applied')
+    assert.equal(appliedBackendPatch.apply.reason, 'merged')
+    assert.equal(appliedBackendPatch.ingestion.pending, false)
+    assertNoForbiddenCloudSyncBackendPlaintext(appliedBackendPatch)
+    assert.equal(JSON.stringify(appliedBackendPatch).includes('Coding Phone'), false)
+
+    let listedWhileLocked = false
+    const locked = await applyTrustedCloudSafePresetPatchesAfterUnlock({
+        storage: {
+            loadAfterUnlock: () => {
+                throw new Error('Desktop cloud sync storage is available only after vault unlock.')
+            }
+        },
+        firestoreClient: {
+            listDocuments: () => {
+                listedWhileLocked = true
+                return []
+            }
+        },
+        functionsClient,
+        deps: mergeHarness.deps
+    })
+    assert.equal(locked.status, 'locked')
+    assert.equal(listedWhileLocked, false)
+
+    const stalePatch = patchFixture({
+        authorDeviceId: phoneState.device.deviceId,
+        baseSnapshotRevisionId: snapshot.revisionId
+    })
+    stalePatch.patchRevisionId = 'patchrev_phase23_7_stale'
+    const staleUpload = await uploadPhoneSafePresetPatch({
+        storage: phoneStorage,
+        functionsClient,
+        patch: stalePatch,
+        now: NOW + 3
+    })
+    const staleHarness = createMergeDeps(workspace)
+    const currentSnapshot = snapshotFixture({
+        sourceDeviceId: desktop.deviceId,
+        revisionId: 'srev_phase23_7_snapshot_2'
+    })
+    const stale = await applyTrustedCloudSafePresetPatchesAfterUnlock({
+        storage: desktopStorage,
+        firestoreClient,
+        functionsClient,
+        deps: staleHarness.deps,
+        snapshotBuilder: () => currentSnapshot,
+        patchRevisionIds: [staleUpload.patchRevisionId],
+        now: NOW + 4
+    })
+    assert.equal(stale.summary.conflicts, 1)
+    assert.equal(stale.records[0].reason, 'stale-base')
+    assert.equal(staleHarness.calls.commits, 0)
+    assert.equal(store.get(`users/${UID}/patches/${staleUpload.patchRevisionId}`).apply.reason, 'stale-base')
+
+    const unknownSafeItemPatch = patchFixture({
+        authorDeviceId: phoneState.device.deviceId,
+        baseSnapshotRevisionId: snapshot.revisionId
+    })
+    unknownSafeItemPatch.patchRevisionId = 'patchrev_phase23_7_unknown_safe_item'
+    unknownSafeItemPatch.presets[0].itemRefs[0].itemId = 'item_phase23_missing'
+    const unknownSafeItemUpload = await uploadPhoneSafePresetPatch({
+        storage: phoneStorage,
+        functionsClient,
+        patch: unknownSafeItemPatch,
+        now: NOW + 5
+    })
+    const unknownSafeItemHarness = createMergeDeps(workspace)
+    const unknownSafeItem = await applyTrustedCloudSafePresetPatchesAfterUnlock({
+        storage: desktopStorage,
+        firestoreClient,
+        functionsClient,
+        deps: unknownSafeItemHarness.deps,
+        snapshotBuilder: () => snapshot,
+        patchRevisionIds: [unknownSafeItemUpload.patchRevisionId],
+        now: NOW + 6
+    })
+    assert.equal(unknownSafeItem.summary.conflicts, 1)
+    assert.equal(unknownSafeItem.records[0].reason, 'unknown-safe-id')
+    assert.equal(unknownSafeItemHarness.calls.commits, 0)
+    assert.equal(store.get(`users/${UID}/patches/${unknownSafeItemUpload.patchRevisionId}`).apply.reason, 'unknown-safe-id')
+
+    const failingPatch = patchFixture({
+        authorDeviceId: phoneState.device.deviceId,
+        baseSnapshotRevisionId: snapshot.revisionId
+    })
+    failingPatch.patchRevisionId = 'patchrev_phase23_7_failing_commit'
+    const failingUpload = await uploadPhoneSafePresetPatch({
+        storage: phoneStorage,
+        functionsClient,
+        patch: failingPatch,
+        now: NOW + 7
+    })
+    const failingHarness = createMergeDeps(workspace, { failCommit: true })
+    const failed = await applyTrustedCloudSafePresetPatchesAfterUnlock({
+        storage: desktopStorage,
+        firestoreClient,
+        functionsClient,
+        deps: failingHarness.deps,
+        snapshotBuilder: () => snapshot,
+        patchRevisionIds: [failingUpload.patchRevisionId],
+        now: NOW + 8
+    })
+    assert.equal(failed.records[0].status, 'skipped')
+    assert.equal(failed.records[0].cloudStatus.status, 'not-recorded')
+    assert.equal(store.get(`users/${UID}/patches/${failingUpload.patchRevisionId}`).apply, undefined)
+    assert.deepEqual(failingHarness.storedWorkspace(), workspace)
+
+    const lockedSessionPatch = patchFixture({
+        authorDeviceId: phoneState.device.deviceId,
+        baseSnapshotRevisionId: snapshot.revisionId
+    })
+    lockedSessionPatch.patchRevisionId = 'patchrev_phase23_7_locked_session'
+    const lockedSessionUpload = await uploadPhoneSafePresetPatch({
+        storage: phoneStorage,
+        functionsClient,
+        patch: lockedSessionPatch,
+        now: NOW + 9
+    })
+    const lockedSessionEnvelope = store.get(`users/${UID}/patches/${lockedSessionUpload.patchRevisionId}`)
+    lockedSessionEnvelope.signature.value = tamperBase64Url(lockedSessionEnvelope.signature.value)
+    store.seed(`users/${UID}/patches/${lockedSessionUpload.patchRevisionId}`, lockedSessionEnvelope)
+    const lockedSessionHarness = createMergeDeps(workspace, { unlocked: false })
+    let lockedSessionCloudReads = 0
+    let lockedSessionDecisionWrites = 0
+    const lockedSessionResult = await applyTrustedCloudSafePresetPatchesAfterUnlock({
+        storage: desktopStorage,
+        firestoreClient: {
+            getDocument: path => {
+                lockedSessionCloudReads += 1
+                return firestoreClient.getDocument(path)
+            },
+            listDocuments: path => {
+                lockedSessionCloudReads += 1
+                return firestoreClient.listDocuments(path)
+            }
+        },
+        functionsClient: {
+            callCloudSyncFunction(name, data) {
+                if (name === 'recordCloudSyncPatchApplyDecision') lockedSessionDecisionWrites += 1
+                return functionsClient.callCloudSyncFunction(name, data)
+            }
+        },
+        deps: lockedSessionHarness.deps,
+        snapshotBuilder: () => {
+            throw new Error('Locked session must not build a snapshot.')
+        },
+        patchRevisionIds: [lockedSessionUpload.patchRevisionId],
+        now: NOW + 10
+    })
+    assert.equal(lockedSessionResult.status, 'locked')
+    assert.equal(lockedSessionResult.records.length, 0)
+    assert.deepEqual(lockedSessionResult.summary, { applied: 0, conflicts: 0, skipped: 0 })
+    assert.equal(lockedSessionCloudReads, 0)
+    assert.equal(lockedSessionDecisionWrites, 0)
+    assert.equal(lockedSessionHarness.calls.commits, 0)
+    assert.equal(store.get(`users/${UID}/patches/${lockedSessionUpload.patchRevisionId}`).apply, undefined)
+    assert.deepEqual(lockedSessionHarness.storedWorkspace(), workspace)
+})
+
+test('trusted cloud patch apply skips invalid signature, invalid key, and revoked-device patches without vault writes', async () => {
+    const store = new InMemoryFirestore()
+    const desktopKeys = signingKeyPair()
+    const phoneKeys = signingKeyPair()
+    const desktop = deviceRecord({
+        deviceId: 'dev_desktop_phase23_invalid',
+        role: 'desktop',
+        syncScopes: ['read', 'snapshot-upload'],
+        keys: desktopKeys
+    })
+    const phone = deviceRecord({
+        deviceId: 'dev_phone_phase23_invalid',
+        role: 'phone',
+        syncScopes: ['read', 'patch-upload'],
+        keys: phoneKeys
+    })
+    store.seed(`users/${UID}/devices/${desktop.deviceId}`, desktop)
+    store.seed(`users/${UID}/devices/${phone.deviceId}`, phone)
+    let desktopState = {
+        ownerUid: UID,
+        device: desktop,
+        syncRootKey: SYNC_ROOT_KEY,
+        signingPrivateKey: desktopKeys.privateKey
+    }
+    const desktopStorage = createDesktopCloudSyncStorage({
+        vaultAdapter: {
+            isUnlocked: () => true,
+            loadCloudSyncState: () => desktopState,
+            updateCloudSyncDeviceSequence: sequence => {
+                desktopState = {
+                    ...desktopState,
+                    device: { ...desktopState.device, deviceSequence: sequence }
+                }
+            }
+        }
+    })
+    let phoneState = {
+        ownerUid: UID,
+        device: phone,
+        syncRootKey: SYNC_ROOT_KEY,
+        signingPrivateKey: phoneKeys.privateKey
+    }
+    const phoneStorage = {
+        loadSessionState: () => Promise.resolve(phoneState),
+        cacheEncryptedPatchEnvelope: () => Promise.resolve(),
+        updateDeviceSequence: sequence => {
+            phoneState = { ...phoneState, device: { ...phoneState.device, deviceSequence: sequence } }
+            return Promise.resolve()
+        }
+    }
+    const firestoreClient = {
+        getDocument: path => Promise.resolve(store.get(path)),
+        listDocuments: path => Promise.resolve(store.list(path))
+    }
+    const functionsClient = {
+        callCloudSyncFunction(name, data) {
+            if (name === 'ingestCloudSyncDocument') {
+                const authDevice = data.operation === CLOUD_SYNC_INGESTION_OPERATIONS.snapshotEnvelope
+                    ? desktopState.device
+                    : phoneState.device
+                return ingestCloudSyncDocument({
+                    store,
+                    auth: authFor(authDevice),
+                    operation: data.operation,
+                    documentId: data.documentId,
+                    document: data.document,
+                    requestedAt: NOW,
+                    now: NOW + 100
+                })
+            }
+            if (name === 'recordCloudSyncPatchApplyDecision') {
+                return ingestCloudSyncDocument({
+                    store,
+                    auth: authFor(desktopState.device),
+                    operation: CLOUD_SYNC_INGESTION_OPERATIONS.patchApplyDecision,
+                    documentId: data.documentId,
+                    document: data.document,
+                    signature: data.signature,
+                    deviceSequence: data.deviceSequence,
+                    requestedAt: data.requestedAt,
+                    now: NOW + 200
+                })
+            }
+            throw new Error(`Unexpected function ${name}`)
+        }
+    }
+    const snapshot = snapshotFixture({
+        sourceDeviceId: desktop.deviceId,
+        revisionId: 'srev_phase23_invalid_snapshot_1'
+    })
+    await uploadDesktopSanitizedSnapshot({
+        storage: desktopStorage,
+        functionsClient,
+        snapshot,
+        now: NOW
+    })
+
+    const invalidSignaturePatch = patchFixture({
+        authorDeviceId: phone.deviceId,
+        baseSnapshotRevisionId: snapshot.revisionId
+    })
+    invalidSignaturePatch.patchRevisionId = 'patchrev_phase23_invalid_signature'
+    const invalidSignatureUpload = await uploadPhoneSafePresetPatch({
+        storage: phoneStorage,
+        functionsClient,
+        patch: invalidSignaturePatch,
+        now: NOW + 1
+    })
+    const tampered = store.get(`users/${UID}/patches/${invalidSignatureUpload.patchRevisionId}`)
+    tampered.signature.value = tamperBase64Url(tampered.signature.value)
+    store.seed(`users/${UID}/patches/${invalidSignatureUpload.patchRevisionId}`, tampered)
+
+    const invalidKeyPatch = patchFixture({
+        authorDeviceId: phone.deviceId,
+        baseSnapshotRevisionId: snapshot.revisionId
+    })
+    invalidKeyPatch.patchRevisionId = 'patchrev_phase23_invalid_key'
+    const invalidKeyUpload = await uploadPhoneSafePresetPatch({
+        storage: phoneStorage,
+        functionsClient,
+        patch: invalidKeyPatch,
+        now: NOW + 2
+    })
+
+    const revokedPatch = patchFixture({
+        authorDeviceId: phone.deviceId,
+        baseSnapshotRevisionId: snapshot.revisionId
+    })
+    revokedPatch.patchRevisionId = 'patchrev_phase23_revoked_device'
+    const revokedUpload = await uploadPhoneSafePresetPatch({
+        storage: phoneStorage,
+        functionsClient,
+        patch: revokedPatch,
+        now: NOW + 3
+    })
+
+    const harness = createMergeDeps(workspaceFixture())
+    let snapshotBuilds = 0
+    desktopState = {
+        ...desktopState,
+        syncRootKey: Buffer.alloc(32, 0x44)
+    }
+    const invalidResult = await applyTrustedCloudSafePresetPatchesAfterUnlock({
+        storage: desktopStorage,
+        firestoreClient,
+        functionsClient,
+        deps: harness.deps,
+        snapshotBuilder: () => {
+            snapshotBuilds += 1
+            return snapshot
+        },
+        patchRevisionIds: [
+            invalidSignatureUpload.patchRevisionId,
+            invalidKeyUpload.patchRevisionId
+        ],
+        now: NOW + 5
+    })
+    store.seed(`users/${UID}/devices/${phone.deviceId}`, {
+        ...store.get(`users/${UID}/devices/${phone.deviceId}`),
+        status: 'revoked',
+        revokedAt: NOW + 6,
+        revokedByDeviceId: desktop.deviceId
+    })
+    const revokedResult = await applyTrustedCloudSafePresetPatchesAfterUnlock({
+        storage: desktopStorage,
+        firestoreClient,
+        functionsClient,
+        deps: harness.deps,
+        snapshotBuilder: () => {
+            snapshotBuilds += 1
+            return snapshot
+        },
+        patchRevisionIds: [revokedUpload.patchRevisionId],
+        now: NOW + 7
+    })
+    const records = [...invalidResult.records, ...revokedResult.records]
+
+    assert.equal(records.filter(record => record.status === 'skipped').length, 3)
+    assert.equal(harness.calls.commits, 0)
+    assert.equal(snapshotBuilds, 0)
+    assert.deepEqual(
+        records.map(record => record.reason).sort(),
+        ['invalid-key', 'invalid-signature', 'revoked-device']
+    )
+    for (const upload of [invalidSignatureUpload, invalidKeyUpload, revokedUpload]) {
+        const stored = store.get(`users/${UID}/patches/${upload.patchRevisionId}`)
+        assert.equal(stored.apply.status, 'skipped')
+        assertNoForbiddenCloudSyncBackendPlaintext(stored)
+    }
 })

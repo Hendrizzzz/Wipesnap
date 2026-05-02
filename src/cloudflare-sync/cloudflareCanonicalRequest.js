@@ -1,13 +1,10 @@
 import {
-    CLOUD_SYNC_SIGNING_ALGORITHM,
-    serializeCanonicalCloudSyncMetadata
-} from '../phone-planner/phonePlannerCloudCrypto.js'
-import {
     CLOUDFLARE_SYNC_CANONICAL_REQUEST_VERSION,
     CLOUDFLARE_SYNC_PROVIDER_ID,
     CLOUDFLARE_SYNC_SIGNING_HEADERS
 } from './cloudflareSyncConstants.js'
 
+const CLOUD_SYNC_SIGNING_ALGORITHM = 'ECDSA-P256-SHA256-P1363'
 const OWNER_UID_PATTERN = /^[A-Za-z0-9:_-]{1,128}$/
 const DEVICE_ID_PATTERN = /^dev_[A-Za-z0-9_-]{1,92}$/
 const SAFE_ROLE_PATTERN = /^(?:desktop|phone|web-planner)$/
@@ -58,6 +55,29 @@ function bytesFrom(value) {
     if (value instanceof ArrayBuffer) return new Uint8Array(value)
     if (typeof value === 'string') return textEncoder.encode(value)
     return textEncoder.encode(JSON.stringify(value ?? null))
+}
+
+function isPlainObject(value) {
+    return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function canonicalizeCloudflareValue(value) {
+    if (Array.isArray(value)) return value.map(canonicalizeCloudflareValue)
+    if (isPlainObject(value)) {
+        const next = {}
+        for (const key of Object.keys(value).sort()) {
+            const nested = value[key]
+            next[key] = nested === undefined ? null : canonicalizeCloudflareValue(nested)
+        }
+        return next
+    }
+    if (value === undefined) return null
+    if (typeof value === 'number' && !Number.isFinite(value)) fail('Canonical Cloudflare sync numbers must be finite.')
+    return value
+}
+
+function serializeCanonicalCloudflareMetadata(value) {
+    return JSON.stringify(canonicalizeCloudflareValue(value))
 }
 
 function encodeBase64Url(bytes) {
@@ -120,7 +140,7 @@ export function createCloudflareCanonicalRequestMetadata(input = {}) {
     const method = requireString(input.method, 'method', /^(?:GET|POST)$/, 8).toUpperCase()
     const path = requireString(input.path, 'path', SAFE_PATH_PATTERN, 240)
     const operation = requireString(input.operation, 'operation', SAFE_OPERATION_PATTERN, 80)
-    return serializeCanonicalCloudSyncMetadata({
+    return serializeCanonicalCloudflareMetadata({
         product: 'wipesnap',
         provider: CLOUDFLARE_SYNC_PROVIDER_ID,
         schemaVersion: CLOUDFLARE_SYNC_CANONICAL_REQUEST_VERSION,

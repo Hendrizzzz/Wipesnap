@@ -8,6 +8,7 @@ vault.state.json
 Apps/
 BrowserProfile/
 run-diagnostics.json
+firestore-debug.log
 .DS_Store
 .env
 _planning/

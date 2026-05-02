@@ -5,12 +5,19 @@ const ASSETS = [
     './styles.css',
     './app.js',
     './phonePlannerCloudCrypto.js',
+    './phonePlannerCloudProvider.js',
     './phonePlannerCloudStorage.js',
     './phonePlannerCloudWorkflow.js',
+    './phonePlannerCloudflareConfig.js',
+    './phonePlannerCloudflareRest.js',
+    './phonePlannerCloudflareWorkflow.js',
     './phonePlannerCore.js',
     './phonePlannerFirebaseConfig.js',
     './phonePlannerFirebaseRest.js',
     './phonePlannerStorage.js',
+    './cloudflare-sync/cloudflareCanonicalRequest.js',
+    './cloudflare-sync/cloudflareSyncConstants.js',
+    './cloudflare-sync/cloudflareSyncFetchClient.js',
     './manifest.webmanifest'
 ]
 

@@ -1,4 +1,5 @@
 export const CLOUDFLARE_SYNC_PROVIDER_ID = 'cloudflare-d1-spike'
+export const CLOUDFLARE_SYNC_STAGING_CONFIG_PROVIDER_ID = 'cloudflare'
 export const CLOUDFLARE_SYNC_SCHEMA_VERSION = 1
 export const CLOUDFLARE_SYNC_CANONICAL_REQUEST_VERSION = 1
 
@@ -27,6 +28,8 @@ export const CLOUDFLARE_SYNC_OPERATIONS = Object.freeze({
     getSnapshot: 'get-snapshot',
     uploadPatch: 'upload-patch',
     listPendingPatches: 'list-pending-patches',
+    getPatch: 'get-patch',
+    getDevice: 'get-device',
     recordPatchDecision: 'record-patch-decision',
     revokeDevice: 'revoke-device'
 })
@@ -42,6 +45,8 @@ export const CLOUDFLARE_SYNC_ROUTES = Object.freeze({
     'GET /v1/snapshots/:revisionId': CLOUDFLARE_SYNC_OPERATIONS.getSnapshot,
     'POST /v1/patches': CLOUDFLARE_SYNC_OPERATIONS.uploadPatch,
     'GET /v1/patches': CLOUDFLARE_SYNC_OPERATIONS.listPendingPatches,
+    'GET /v1/patches/:revisionId': CLOUDFLARE_SYNC_OPERATIONS.getPatch,
+    'GET /v1/devices/:deviceId': CLOUDFLARE_SYNC_OPERATIONS.getDevice,
     'POST /v1/patches/:revisionId/decision': CLOUDFLARE_SYNC_OPERATIONS.recordPatchDecision,
     'POST /v1/devices/:deviceId/revoke': CLOUDFLARE_SYNC_OPERATIONS.revokeDevice
 })

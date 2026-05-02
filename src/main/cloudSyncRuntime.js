@@ -1,6 +1,11 @@
 import { createHash } from 'crypto'
 import { buildSanitizedPresetSnapshot } from './sanitizedPresetSnapshot.js'
 import { createDesktopCloudSyncStorage } from './cloudSyncClientStorage.js'
+import {
+    createCloudflareDesktopTransportAdapters,
+    validateDesktopCloudflareSyncConfig
+} from './cloudSyncCloudflareTransport.js'
+import { CLOUD_SYNC_PROVIDER_IDS } from './cloudSyncProviderPlan.js'
 
 function isPlainObject(value) {
     return !!value && typeof value === 'object' && !Array.isArray(value)
@@ -95,6 +100,47 @@ function resolveFunctionsClient(runtime) {
     }
 }
 
+function explicitCloudflareConfig(runtime) {
+    const config = runtime.cloudflareSyncConfig ||
+        runtime.cloudSyncProviderConfig ||
+        runtime.cloudflare?.config ||
+        null
+    if (!config || !isPlainObject(config)) return null
+    const provider = config.provider
+    if (provider !== 'cloudflare' && provider !== CLOUD_SYNC_PROVIDER_IDS.cloudflare) return null
+    return config
+}
+
+function resolveCloudflareTransport(runtime, storage) {
+    const config = explicitCloudflareConfig(runtime)
+    if (!config) return null
+    if (!storage) {
+        return {
+            unavailable: true,
+            reason: 'storage-unavailable'
+        }
+    }
+    try {
+        const safeConfig = validateDesktopCloudflareSyncConfig(config)
+        const adapters = createCloudflareDesktopTransportAdapters({
+            config: safeConfig,
+            storage,
+            fetchImpl: runtime.cloudflareFetch || runtime.fetchImpl || globalThis.fetch?.bind(globalThis),
+            cryptoApi: runtime.cryptoApi || globalThis.crypto,
+            now: runtime.now || Date.now
+        })
+        return {
+            provider: safeConfig.provider,
+            ...adapters
+        }
+    } catch (_) {
+        return {
+            unavailable: true,
+            reason: 'invalid-cloudflare-config'
+        }
+    }
+}
+
 function createDefaultSnapshotBuilder(runtime, storage) {
     if (!storage || typeof storage.loadAfterUnlock !== 'function') return null
     return async ({ ownerUid, device, now, workspace } = {}) => {
@@ -138,18 +184,31 @@ function resolveSnapshotBuilder(runtime, storage) {
 export function createCloudSyncRuntimeAdapter({ runtime, baseDeps = {} } = {}) {
     const safeRuntime = normalizeRuntime(runtime)
     const storage = resolveStorage(safeRuntime)
-    const firestoreClient = resolveFirestoreClient(safeRuntime)
-    const functionsClient = resolveFunctionsClient(safeRuntime)
+    const cloudflareTransport = resolveCloudflareTransport(safeRuntime, storage)
+    const cloudflareSelected = !!cloudflareTransport
+    const firestoreClient = cloudflareTransport?.unavailable
+        ? null
+        : cloudflareTransport?.firestoreClient || resolveFirestoreClient(safeRuntime)
+    const functionsClient = cloudflareTransport?.unavailable
+        ? null
+        : cloudflareTransport?.functionsClient || resolveFunctionsClient(safeRuntime)
     const buildCurrentSanitizedSnapshot = resolveSnapshotBuilder(safeRuntime, storage)
+    const provider = cloudflareTransport?.provider ||
+        (cloudflareSelected ? CLOUD_SYNC_PROVIDER_IDS.cloudflare : (firestoreClient || functionsClient ? CLOUD_SYNC_PROVIDER_IDS.firebase : 'disabled'))
 
     return {
         ...baseDeps,
         ...(storage ? { storage } : {}),
         ...(firestoreClient ? { firestoreClient } : {}),
         ...(functionsClient ? { functionsClient } : {}),
+        ...(cloudflareTransport?.client ? { cloudflareClient: cloudflareTransport.client } : {}),
         ...(buildCurrentSanitizedSnapshot ? { buildCurrentSanitizedSnapshot } : {}),
         cloudSyncRuntime: {
             available: !!(storage && firestoreClient && functionsClient && buildCurrentSanitizedSnapshot),
+            provider,
+            cloudflare: cloudflareTransport?.unavailable
+                ? { status: 'unavailable', reason: cloudflareTransport.reason, metadataOnly: true }
+                : { status: cloudflareTransport ? 'configured-disabled-staging' : 'not-selected', metadataOnly: true },
             storage: !!storage,
             firestore: !!firestoreClient,
             functions: !!functionsClient,

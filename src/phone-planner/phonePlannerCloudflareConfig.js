@@ -1,10 +1,14 @@
-import { CLOUDFLARE_SYNC_PROVIDER_ID } from '../cloudflare-sync/cloudflareSyncConstants.js'
+import {
+    CLOUDFLARE_SYNC_PROVIDER_ID,
+    CLOUDFLARE_SYNC_STAGING_CONFIG_PROVIDER_ID
+} from '../cloudflare-sync/cloudflareSyncConstants.js'
 
 export const PHONE_PLANNER_CLOUDFLARE_CONFIG_URL = './cloudflare-sync-config.json'
 
 const ALLOWED_CONFIG_KEYS = new Set([
     'environment',
     'provider',
+    'requestedProvider',
     'apiBaseUrl',
     'useLocalDev',
     'maxEnvelopeJsonBytes'
@@ -119,11 +123,23 @@ export function validatePhonePlannerCloudflareConfig(input) {
     const environment = requireString(input.environment, 'phone planner Cloudflare config.environment', /^[a-z][a-z0-9-]{1,40}$/i, 40).toLowerCase()
     if (environment !== 'staging') fail('Hosted phone planner Cloudflare provider must use staging config.')
     const provider = requireString(input.provider, 'phone planner Cloudflare config.provider', /^[a-z0-9-]{1,80}$/i, 80)
-    if (provider !== CLOUDFLARE_SYNC_PROVIDER_ID) fail('Hosted phone planner Cloudflare provider id is not supported.')
+    if (![CLOUDFLARE_SYNC_PROVIDER_ID, CLOUDFLARE_SYNC_STAGING_CONFIG_PROVIDER_ID].includes(provider)) {
+        fail('Hosted phone planner Cloudflare provider id is not supported.')
+    }
+    const requestedProvider = input.requestedProvider == null
+        ? provider
+        : requireString(input.requestedProvider, 'phone planner Cloudflare config.requestedProvider', /^[a-z0-9-]{1,80}$/i, 80)
+    if (![CLOUDFLARE_SYNC_PROVIDER_ID, CLOUDFLARE_SYNC_STAGING_CONFIG_PROVIDER_ID].includes(requestedProvider)) {
+        fail('Hosted phone planner Cloudflare requested provider id is not supported.')
+    }
+    if (provider === CLOUDFLARE_SYNC_STAGING_CONFIG_PROVIDER_ID && requestedProvider !== provider) {
+        fail('Hosted phone planner Cloudflare requested provider does not match the config provider.')
+    }
     const useLocalDev = requireBoolean(input.useLocalDev, 'phone planner Cloudflare config.useLocalDev', false)
     return {
         environment,
-        provider,
+        provider: CLOUDFLARE_SYNC_PROVIDER_ID,
+        requestedProvider,
         apiBaseUrl: normalizeApiBaseUrl(input.apiBaseUrl, useLocalDev),
         useLocalDev,
         maxEnvelopeJsonBytes: requireInteger(input.maxEnvelopeJsonBytes, 'phone planner Cloudflare config.maxEnvelopeJsonBytes', {

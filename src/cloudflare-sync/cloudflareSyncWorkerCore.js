@@ -197,6 +197,12 @@ function routeFor(request) {
     if (method === 'GET' && /^\/v1\/snapshots\/[^/]+$/.test(url.pathname)) {
         return { operation: CLOUDFLARE_SYNC_OPERATIONS.getSnapshot, path: url.pathname }
     }
+    if (method === 'GET' && /^\/v1\/patches\/[^/]+$/.test(url.pathname)) {
+        return { operation: CLOUDFLARE_SYNC_OPERATIONS.getPatch, path: url.pathname }
+    }
+    if (method === 'GET' && /^\/v1\/devices\/[^/]+$/.test(url.pathname)) {
+        return { operation: CLOUDFLARE_SYNC_OPERATIONS.getDevice, path: url.pathname }
+    }
     if (method === 'POST' && /^\/v1\/patches\/[^/]+\/decision$/.test(url.pathname)) {
         return { operation: CLOUDFLARE_SYNC_OPERATIONS.recordPatchDecision, path: url.pathname }
     }
@@ -327,6 +333,7 @@ async function verifyRequest({ store, request, route, bodyText, bodyJson, now, c
     }
     const bucketMs = Math.floor(now / CLOUDFLARE_SYNC_LIMITS.rateWindowMs) * CLOUDFLARE_SYNC_LIMITS.rateWindowMs
     const preEnrollmentRateLimit = RATE_LIMITED_OPERATIONS.get(route.operation)
+    const sequenceAdvanced = !preEnrollmentRateLimit
     if (preEnrollmentRateLimit) {
         await store.recordRateLimit({
             ownerUid: auth.ownerUid,
@@ -356,7 +363,7 @@ async function verifyRequest({ store, request, route, bodyText, bodyJson, now, c
             now
         })
     }
-    return { auth, device: signatureDevice }
+    return { auth, device: signatureDevice, sequenceAdvanced }
 }
 
 export function createCloudflareSyncWorkerCore({
@@ -368,12 +375,13 @@ export function createCloudflareSyncWorkerCore({
     const clock = () => (typeof now === 'function' ? now() : now)
 
     async function handle(request) {
+        let verified = null
         try {
             const route = routeFor(request)
             if (!route) return responseJson({ error: 'not-found', status: 'not-found' }, 404)
             const currentTime = clock()
             const body = await readBody(request)
-            const verified = await verifyRequest({
+            verified = await verifyRequest({
                 store,
                 request,
                 route,
@@ -394,10 +402,13 @@ export function createCloudflareSyncWorkerCore({
             })
             return responseJson(payload)
         } catch (error) {
+            const recoveredSequence = verified?.sequenceAdvanced === true
+                ? { deviceSequence: verified.auth.deviceSequence }
+                : {}
             if (error instanceof CloudflareSyncError) {
-                return responseJson({ error: error.code, status: 'rejected', message: error.message }, error.status)
+                return responseJson({ error: error.code, status: 'rejected', message: error.message, ...recoveredSequence }, error.status)
             }
-            return responseJson({ error: 'rejected', status: 'rejected', message: 'Cloudflare sync request failed.' }, 500)
+            return responseJson({ error: 'rejected', status: 'rejected', message: 'Cloudflare sync request failed.', ...recoveredSequence }, 500)
         }
     }
 
@@ -476,6 +487,18 @@ async function dispatch({ store, operation, auth, device, body, request, now }) 
         assertRole(auth, ['desktop'])
         assertScope(device, 'read')
         return { status: 'listed', records: await store.listPatches(auth.ownerUid, 'pending') }
+    }
+    if (operation === CLOUDFLARE_SYNC_OPERATIONS.getPatch) {
+        assertRole(auth, ['desktop'])
+        assertScope(device, 'read')
+        const revisionId = safeString(new URL(request.url).pathname.split('/').pop(), 'patchRevisionId', /^patchrev_[A-Za-z0-9_-]{1,85}$/, 96)
+        const patch = await store.getPatch(auth.ownerUid, revisionId, 'pending')
+        return { status: patch ? 'downloaded' : 'not-found', envelope: patch?.envelope || null, patchStatus: patch?.status || 'not-found' }
+    }
+    if (operation === CLOUDFLARE_SYNC_OPERATIONS.getDevice) {
+        assertScope(device, 'read')
+        const targetDeviceId = safeString(new URL(request.url).pathname.split('/').pop(), 'targetDeviceId', /^dev_[A-Za-z0-9_-]{1,92}$/, 96)
+        return { status: 'downloaded', device: await store.getDevice(auth.ownerUid, targetDeviceId) }
     }
     if (operation === CLOUDFLARE_SYNC_OPERATIONS.recordPatchDecision) {
         assertRole(auth, ['desktop'])

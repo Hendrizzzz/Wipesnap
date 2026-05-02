@@ -251,6 +251,26 @@ export function createPhonePlannerCloudStorage({
             session.wrappingKey = await loadCryptoKey(keyRef('wrapping', safeDeviceId))
             return clone(record)
         },
+        async updateEnrollmentRequestDeviceSequence({ deviceId, deviceSequence } = {}) {
+            const safeDeviceId = normalizeSafeId(deviceId, 'deviceId', 'dev_')
+            const sequence = normalizeInteger(deviceSequence, 'deviceSequence')
+            const record = await indexedDbAdapter.get('cloudSyncEnrollmentRequests', safeDeviceId)
+            if (!record) return { status: 'skipped', metadataOnly: true }
+            const device = validateCloudSyncDeviceRecordForPhone(record.device)
+            if (sequence < device.deviceSequence) {
+                return { status: 'skipped', deviceSequence: device.deviceSequence, metadataOnly: true }
+            }
+            const nextDevice = { ...device, deviceSequence: sequence, updatedAt: now() }
+            const nextRecord = { ...record, device: nextDevice, updatedAt: now() }
+            assertNoRawKeyMaterial({
+                ...nextRecord,
+                // The pairing challenge is intentionally user-visible and one-time; do not scan it as a token.
+                pairingChallenge: ''
+            })
+            await indexedDbAdapter.put('cloudSyncEnrollmentRequests', safeDeviceId, nextRecord)
+            if (session.device?.deviceId === safeDeviceId) session.device = nextDevice
+            return { status: 'updated', deviceSequence: sequence, metadataOnly: true }
+        },
         async loadPendingDeviceState(deviceId) {
             const safeDeviceId = normalizeSafeId(deviceId, 'deviceId', 'dev_')
             const metadata = await indexedDbAdapter.get('cloudSyncDeviceMetadata', safeDeviceId)

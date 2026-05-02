@@ -32,8 +32,12 @@ import {
     loadPhonePlannerState,
     savePhonePlannerState
 } from './phonePlannerStorage.js'
-import { loadPhonePlannerFirebaseConfig } from './phonePlannerFirebaseConfig.js'
 import { createPhonePlannerFirebaseRestApp } from './phonePlannerFirebaseRest.js'
+import {
+    PHONE_PLANNER_CLOUD_PROVIDER_IDS,
+    loadPhonePlannerCloudProviderConfig
+} from './phonePlannerCloudProvider.js'
+import { createPhonePlannerCloudflareRestApp } from './phonePlannerCloudflareRest.js'
 import {
     createIndexedDbAdapter,
     createPhonePlannerCloudStorage
@@ -44,6 +48,10 @@ import {
     requestHostedPlannerEnrollment,
     uploadHostedPlannerSafePatch
 } from './phonePlannerCloudWorkflow.js'
+import {
+    claimCloudflareHostedPlannerDeviceSession,
+    requestCloudflareHostedPlannerEnrollment
+} from './phonePlannerCloudflareWorkflow.js'
 
 let state = loadPhonePlannerState()
 let statusMessage = state.loadError || 'Saved locally on this browser.'
@@ -63,8 +71,10 @@ let cloudState = {
     message: 'Loading staging cloud config.',
     error: '',
     busy: '',
+    provider: 'disabled',
     config: null,
     authClient: null,
+    cloudflareClient: null,
     functionsClient: null,
     firestoreClient: null,
     storage: null,
@@ -366,12 +376,17 @@ function refreshCloudAuthState() {
         : { signedIn: false, uid: '', email: '', metadataOnly: true }
 }
 
+function isCloudflareCloudProvider() {
+    return cloudState.provider === PHONE_PLANNER_CLOUD_PROVIDER_IDS.cloudflare
+}
+
 function requireCloudRuntime() {
     if (!cloudState.authClient || !cloudState.functionsClient || !cloudState.firestoreClient || !cloudState.storage) {
         throw new Error('Hosted staging cloud is not configured.')
     }
     return {
         authClient: cloudState.authClient,
+        cloudflareClient: cloudState.cloudflareClient,
         functionsClient: cloudState.functionsClient,
         firestoreClient: cloudState.firestoreClient,
         storage: cloudState.storage
@@ -411,6 +426,13 @@ function cloudMessageForResult(actionName, result) {
 
 async function signInHostedCloud(createUser = false) {
     await runHostedCloudAction(createUser ? 'create-user' : 'sign-in', async ({ authClient }) => {
+        if (isCloudflareCloudProvider()) {
+            const ownerUid = cloudState.email.trim()
+            if (!ownerUid) throw new Error('Owner uid is required.')
+            const result = await authClient.activateOwnerUid(ownerUid)
+            cloudState.password = ''
+            return result
+        }
         const email = cloudState.email.trim()
         const password = cloudState.password
         if (!email || !password) throw new Error('Email and password are required.')
@@ -427,12 +449,18 @@ async function signInHostedCloudAnonymously() {
 }
 
 async function requestHostedCloudEnrollment() {
-    await runHostedCloudAction('request-enrollment', async ({ authClient, functionsClient, storage }) => {
-        const result = await requestHostedPlannerEnrollment({
-            authClient,
-            functionsClient,
-            storage
-        })
+    await runHostedCloudAction('request-enrollment', async ({ authClient, cloudflareClient, functionsClient, storage }) => {
+        const result = isCloudflareCloudProvider()
+            ? await requestCloudflareHostedPlannerEnrollment({
+                authClient,
+                cloudflareClient,
+                storage
+            })
+            : await requestHostedPlannerEnrollment({
+                authClient,
+                functionsClient,
+                storage
+            })
         cloudState.deviceId = result.deviceId
         cloudState.requestId = result.requestId
         cloudState.keyGrantId = result.keyGrantId
@@ -442,16 +470,23 @@ async function requestHostedCloudEnrollment() {
 }
 
 async function claimHostedCloudSession() {
-    await runHostedCloudAction('claim-session', async ({ authClient, functionsClient, firestoreClient, storage }) => {
+    await runHostedCloudAction('claim-session', async ({ authClient, cloudflareClient, functionsClient, firestoreClient, storage }) => {
         const deviceId = (cloudState.deviceId || cloudState.requestId).trim()
         if (!deviceId) throw new Error('A phone enrollment request id is required.')
-        const result = await claimHostedPlannerDeviceSession({
-            authClient,
-            functionsClient,
-            firestoreClient,
-            storage,
-            deviceId
-        })
+        const result = isCloudflareCloudProvider()
+            ? await claimCloudflareHostedPlannerDeviceSession({
+                authClient,
+                cloudflareClient,
+                storage,
+                deviceId
+            })
+            : await claimHostedPlannerDeviceSession({
+                authClient,
+                functionsClient,
+                firestoreClient,
+                storage,
+                deviceId
+            })
         cloudState.deviceId = result.deviceId
         cloudState.keyGrantId = result.keyGrantId
         cloudState.syncKeyActive = result.syncKeyActive === true
@@ -490,17 +525,21 @@ async function uploadHostedCloudPatch() {
 
 async function initializeHostedCloud() {
     try {
-        const config = await loadPhonePlannerFirebaseConfig()
-        const restApp = createPhonePlannerFirebaseRestApp({ config })
+        const selectedProvider = await loadPhonePlannerCloudProviderConfig()
         const storage = createPhonePlannerCloudStorage({
             indexedDbAdapter: createIndexedDbAdapter()
         })
+        const restApp = selectedProvider.provider === PHONE_PLANNER_CLOUD_PROVIDER_IDS.cloudflare
+            ? createPhonePlannerCloudflareRestApp({ config: selectedProvider.config, storage })
+            : createPhonePlannerFirebaseRestApp({ config: selectedProvider.config })
         cloudState = {
             ...cloudState,
             status: 'ready',
             message: 'Staging cloud ready.',
-            config,
+            provider: selectedProvider.provider,
+            config: selectedProvider.config,
             authClient: restApp.authClient,
+            cloudflareClient: restApp.cloudflareClient || null,
             functionsClient: restApp.functionsClient,
             firestoreClient: restApp.firestoreClient,
             storage
@@ -558,12 +597,13 @@ function renderHostedCloudPanel(editor) {
     const ready = cloudState.status === 'ready'
     const signedIn = cloudState.auth?.signedIn === true
     const busy = !!cloudState.busy
+    const cloudflareProvider = isCloudflareCloudProvider()
     const canClaim = ready && signedIn && !!(cloudState.deviceId || cloudState.requestId)
     const cloudStatus = cloudState.error || cloudState.message
     return createElement('section', { className: `panel wide hosted-cloud ${cloudState.error ? 'blocked' : ''}` }, [
         createElement('div', { className: 'section-head' }, [
             createElement('h2', { text: 'Hosted Staging Cloud' }),
-            createElement('span', { text: ready ? (signedIn ? 'signed in' : 'auth required') : cloudState.status })
+            createElement('span', { text: ready ? (signedIn ? (cloudflareProvider ? 'owner set' : 'signed in') : 'auth required') : cloudState.status })
         ]),
         createElement('p', {
             className: `helper ${cloudState.error ? 'cloud-error' : ''}`,
@@ -571,13 +611,13 @@ function renderHostedCloudPanel(editor) {
         }),
         createElement('div', { className: 'grid two' }, [
             textInput({
-                label: 'Email',
+                label: cloudflareProvider ? 'Owner UID' : 'Email',
                 value: cloudState.email,
                 maxLength: 160,
-                type: 'email',
+                type: cloudflareProvider ? 'text' : 'email',
                 onInput: value => { cloudState.email = value }
             }),
-            textInput({
+            cloudflareProvider ? null : textInput({
                 label: 'Password',
                 value: cloudState.password,
                 maxLength: 256,
@@ -586,9 +626,14 @@ function renderHostedCloudPanel(editor) {
             })
         ]),
         createElement('div', { className: 'toolbar-actions' }, [
-            button(busy && cloudState.busy === 'sign-in' ? 'Signing In' : 'Sign In', 'btn primary', () => signInHostedCloud(false), !ready || busy),
-            button(busy && cloudState.busy === 'create-user' ? 'Creating' : 'Create User', 'btn', () => signInHostedCloud(true), !ready || busy),
-            cloudState.config?.allowAnonymousAuth
+            button(
+                busy && cloudState.busy === 'sign-in' ? (cloudflareProvider ? 'Setting Owner' : 'Signing In') : (cloudflareProvider ? 'Set Owner' : 'Sign In'),
+                'btn primary',
+                () => signInHostedCloud(false),
+                !ready || busy
+            ),
+            cloudflareProvider ? null : button(busy && cloudState.busy === 'create-user' ? 'Creating' : 'Create User', 'btn', () => signInHostedCloud(true), !ready || busy),
+            !cloudflareProvider && cloudState.config?.allowAnonymousAuth
                 ? button(busy && cloudState.busy === 'anonymous-auth' ? 'Signing In' : 'Anonymous', 'btn', () => signInHostedCloudAnonymously(), !ready || busy)
                 : null
         ]),
@@ -619,6 +664,7 @@ function renderHostedCloudPanel(editor) {
         ]),
         createElement('div', { className: 'cloud-meta-line' }, [
             createElement('span', { text: cloudState.auth?.email || cloudState.auth?.uid || 'not signed in' }),
+            createElement('span', { text: cloudflareProvider ? 'cloudflare disabled staging' : 'firebase staging' }),
             cloudState.lastSnapshotRevisionId ? createElement('span', { text: `snapshot ${cloudState.lastSnapshotRevisionId}` }) : null,
             cloudState.lastPatchRevisionId ? createElement('span', { text: `patch ${cloudState.lastPatchRevisionId}` }) : null
         ])

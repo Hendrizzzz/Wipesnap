@@ -5,6 +5,12 @@ const path = require('path')
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 4176
 const PHONE_PLANNER_STATIC_ROOT = path.resolve(__dirname, '..', 'src', 'phone-planner')
+const CLOUDFLARE_SYNC_STATIC_ROOT = path.resolve(__dirname, '..', 'src', 'cloudflare-sync')
+const CLOUDFLARE_SYNC_STATIC_FILES = new Set([
+    'cloudflareCanonicalRequest.js',
+    'cloudflareSyncConstants.js',
+    'cloudflareSyncFetchClient.js'
+])
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1'])
 
 const MIME_TYPES = new Map([
@@ -111,11 +117,18 @@ function resolvePhonePlannerRequest(requestUrl, { staticRoot = PHONE_PLANNER_STA
         return { ok: false, statusCode: 403, reason: 'path-traversal' }
     }
 
+    const cloudflareSyncRequest = segments[0] === 'cloudflare-sync'
     const pathname = decodedPathname === '/' || decodedPathname.endsWith('/')
         ? `${decodedPathname}index.html`
         : decodedPathname
-    const root = path.resolve(staticRoot)
-    const filePath = path.resolve(root, `.${pathname}`)
+    const root = cloudflareSyncRequest ? CLOUDFLARE_SYNC_STATIC_ROOT : path.resolve(staticRoot)
+    const relativePathname = cloudflareSyncRequest
+        ? `/${segments.slice(1).join('/')}`
+        : pathname
+    if (cloudflareSyncRequest && (!segments[1] || segments.length !== 2 || !CLOUDFLARE_SYNC_STATIC_FILES.has(segments[1]))) {
+        return { ok: false, statusCode: 404, reason: 'not-found' }
+    }
+    const filePath = path.resolve(root, `.${relativePathname}`)
     if (!isWithinRoot(root, filePath)) {
         return { ok: false, statusCode: 403, reason: 'outside-static-root' }
     }
@@ -245,6 +258,8 @@ if (require.main === module) {
 module.exports = {
     DEFAULT_HOST,
     DEFAULT_PORT,
+    CLOUDFLARE_SYNC_STATIC_FILES,
+    CLOUDFLARE_SYNC_STATIC_ROOT,
     PHONE_PLANNER_STATIC_ROOT,
     createRequestHandler,
     getContentType,

@@ -10,6 +10,7 @@ const require = createRequire(import.meta.url)
 const firebaseJson = require('../firebase.json')
 const packageJson = require('../package.json')
 const {
+    CLOUDFLARE_SYNC_STAGING_FILES,
     FORBIDDEN_ARTIFACT_NAMES,
     FORBIDDEN_ARTIFACT_SEGMENTS,
     OPTIONAL_STAGING_CONFIGS,
@@ -20,6 +21,7 @@ const {
     targetDir
 } = require('../scripts/build-phone-planner-staging.cjs')
 const {
+    CLOUDFLARE_SYNC_STATIC_ROOT,
     PHONE_PLANNER_STATIC_ROOT,
     parseArgs,
     resolvePhonePlannerRequest,
@@ -69,6 +71,8 @@ test('phone planner server defaults to loopback and rejects non-loopback binds',
 test('phone planner static resolver confines requests to src/phone-planner', () => {
     const index = resolvePhonePlannerRequest('/')
     const app = resolvePhonePlannerRequest('/app.js')
+    const cloudflareFetchClient = resolvePhonePlannerRequest('/cloudflare-sync/cloudflareSyncFetchClient.js')
+    const cloudflareForbidden = resolvePhonePlannerRequest('/cloudflare-sync/cloudflareD1Store.js')
     const traversal = resolvePhonePlannerRequest('/..%2Fpackage.json')
     const encodedTraversal = resolvePhonePlannerRequest('/%2e%2e/vault.json')
     const backslashTraversal = resolvePhonePlannerRequest('/..%5Cpackage.json')
@@ -77,6 +81,10 @@ test('phone planner static resolver confines requests to src/phone-planner', () 
     assert.equal(path.resolve(index.filePath), path.join(PHONE_PLANNER_STATIC_ROOT, 'index.html'))
     assert.equal(app.ok, true)
     assert.equal(path.resolve(app.filePath), path.join(PHONE_PLANNER_STATIC_ROOT, 'app.js'))
+    assert.equal(cloudflareFetchClient.ok, true)
+    assert.equal(path.resolve(cloudflareFetchClient.filePath), path.join(CLOUDFLARE_SYNC_STATIC_ROOT, 'cloudflareSyncFetchClient.js'))
+    assert.equal(cloudflareForbidden.ok, false)
+    assert.equal(cloudflareForbidden.statusCode, 404)
     assert.equal(traversal.ok, false)
     assert.equal(traversal.statusCode, 403)
     assert.equal(encodedTraversal.ok, false)
@@ -122,6 +130,7 @@ test('Firebase Hosting serves only the staged phone planner artifact with narrow
     assert.match(csp, /identitytoolkit\.googleapis\.com/)
     assert.match(csp, /firestore\.googleapis\.com/)
     assert.match(csp, /cloudfunctions\.net/)
+    assert.match(csp, /workers\.dev/)
 
     for (const fileName of PHONE_PLANNER_STAGING_FILES) {
         assert.equal(path.dirname(fileName), '.')
@@ -130,6 +139,8 @@ test('Firebase Hosting serves only the staged phone planner artifact with narrow
     }
     assert.equal(PHONE_PLANNER_STAGING_FILES.includes('app.js'), true)
     assert.equal(PHONE_PLANNER_STAGING_FILES.includes('phonePlannerCloudWorkflow.js'), true)
+    assert.equal(PHONE_PLANNER_STAGING_FILES.includes('phonePlannerCloudflareRest.js'), true)
+    assert.equal(CLOUDFLARE_SYNC_STAGING_FILES.includes('cloudflareSyncFetchClient.js'), true)
     assert.equal(PHONE_PLANNER_STAGING_FILES.includes('firebase-staging-config.example.json'), true)
     assert.equal(PHONE_PLANNER_STAGING_FILES.includes('cloudflare-sync-config.example.json'), true)
 
@@ -138,6 +149,8 @@ test('Firebase Hosting serves only the staged phone planner artifact with narrow
     const artifactFiles = new Set(fs.readdirSync(targetDir))
     assert.equal(artifactFiles.has('index.html'), true)
     assert.equal(artifactFiles.has('app.js'), true)
+    assert.equal(artifactFiles.has('cloudflare-sync'), true)
+    assert.equal(fs.existsSync(path.join(targetDir, 'cloudflare-sync', 'cloudflareSyncFetchClient.js')), true)
     assert.equal(artifactFiles.has('functions'), false)
     assert.equal(artifactFiles.has('tests'), false)
     assert.equal(artifactFiles.has('vault.json'), false)
@@ -164,7 +177,7 @@ test('hosted artifact optional staging configs are copied only when explicitly p
 
         fs.writeFileSync(path.join(sourceRoot, 'cloudflare-sync-config.json'), JSON.stringify({
             environment: 'staging',
-            provider: 'cloudflare-d1-spike',
+            provider: 'cloudflare',
             apiBaseUrl: 'https://example-stage.workers.dev',
             useLocalDev: false
         }))

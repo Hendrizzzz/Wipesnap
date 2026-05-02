@@ -72,6 +72,7 @@ const wipesnapApi = {
         downloadEncryptedPatchSummaries: (data) => invokeCloudSync('cloud-sync:download-encrypted-patch-summaries', data),
         planSafePresetPatches: (data) => invokeCloudSync('cloud-sync:plan-safe-preset-patches', data),
         applyTrustedPatches: (data) => invokeCloudSync('cloud-sync:apply-trusted-patches', data),
+        bootstrapDesktopDevice: () => ipcRenderer.invoke('cloud-sync:bootstrap-desktop-device'),
         listPendingDeviceEnrollments: () => ipcRenderer.invoke('cloud-sync:list-pending-device-enrollments'),
         approveDeviceEnrollment: (data) => ipcRenderer.invoke(
             'cloud-sync:approve-device-enrollment',

@@ -417,6 +417,79 @@ test('bootstrap and enrollment are create-only and cannot overwrite active or re
     }
 })
 
+test('D1 approval keeps device activation, key grant, and request approval atomic', async () => {
+    async function setup(suffix) {
+        const db = createMigratedLocalD1Database()
+        const store = createCloudflareD1Store({ db })
+        const desktop = await desktopDevice({ deviceId: `dev_desktop_phase31_3_atomic_${suffix}` })
+        const phone = await phoneDevice({ deviceId: `dev_web_phase31_3_atomic_${suffix}` })
+        await store.bootstrapDesktop({ ownerUid: OWNER, device: desktop.device, now: NOW })
+        await store.requestEnrollment({
+            ownerUid: OWNER,
+            requestId: phone.device.deviceId,
+            device: phone.device,
+            pairingChallengeHash: await sha256Base64Url(`phase31.3 atomic ${phone.device.deviceId}`, webcrypto),
+            now: NOW + 1
+        })
+        return {
+            db,
+            store,
+            desktop,
+            phone,
+            grant: await keyGrant({
+                recipientDeviceId: phone.device.deviceId,
+                createdByDeviceId: desktop.device.deviceId
+            })
+        }
+    }
+
+    function failBatchOnSql(db, pattern) {
+        const originalBatch = db.batch.bind(db)
+        db.batch = statements => originalBatch(statements.map(statement => (
+            pattern.test(statement.sql)
+                ? { run: () => { throw new Error('injected approval write failure') } }
+                : statement
+        )))
+        return () => { db.batch = originalBatch }
+    }
+
+    for (const failure of [
+        { name: 'key grant insert', suffix: 'grant_insert', pattern: /INSERT INTO cloudflare_sync_key_grants/i },
+        { name: 'request approval update', suffix: 'request_update', pattern: /UPDATE cloudflare_sync_enrollment_requests\s+SET status = 'approved'/i }
+    ]) {
+        const { db, store, desktop, phone, grant } = await setup(failure.suffix)
+        const restore = failBatchOnSql(db, failure.pattern)
+        try {
+            await assert.rejects(() => store.approveEnrollment({
+                ownerUid: OWNER,
+                requestId: phone.device.deviceId,
+                desktopDeviceId: desktop.device.deviceId,
+                keyGrant: grant,
+                now: NOW + 2
+            }), error => error.code === 'approval-conflict')
+            const deviceRow = db.prepare('SELECT status FROM cloudflare_sync_devices WHERE owner_uid = ? AND device_id = ?')
+                .bind(OWNER, phone.device.deviceId)
+                .first()
+            assert.equal(deviceRow.status, 'pending', failure.name)
+            const requestRow = db.prepare('SELECT status, approved_at, approved_by_device_id, key_grant_id FROM cloudflare_sync_enrollment_requests WHERE owner_uid = ? AND request_id = ?')
+                .bind(OWNER, phone.device.deviceId)
+                .first()
+            assert.equal(requestRow.status, 'pending', failure.name)
+            assert.equal(requestRow.approved_at, null, failure.name)
+            assert.equal(requestRow.approved_by_device_id, null, failure.name)
+            assert.equal(requestRow.key_grant_id, null, failure.name)
+            const grants = db.prepare('SELECT COUNT(*) AS count FROM cloudflare_sync_key_grants WHERE owner_uid = ? AND grant_id = ?')
+                .bind(OWNER, grant.grantId)
+                .first()
+                .count
+            assert.equal(grants, 0, failure.name)
+        } finally {
+            restore()
+            db.close()
+        }
+    }
+})
+
 test('D1 sequence advancement uses compare-and-swap and rejects stale out-of-order requests', async () => {
     const db = createMigratedLocalD1Database()
     try {

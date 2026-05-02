@@ -3,6 +3,7 @@ const { basename, join, relative, resolve, sep } = require('path')
 
 const repoRoot = resolve(__dirname, '..')
 const sourceDir = join(repoRoot, 'src', 'phone-planner')
+const cloudflareSyncSourceDir = join(repoRoot, 'src', 'cloudflare-sync')
 const targetDir = join(repoRoot, 'out', 'phone-planner-staging')
 
 const PHONE_PLANNER_STAGING_FILES = Object.freeze([
@@ -14,6 +15,8 @@ const PHONE_PLANNER_STAGING_FILES = Object.freeze([
     'phonePlannerCloudStorage.js',
     'phonePlannerCloudWorkflow.js',
     'phonePlannerCloudflareConfig.js',
+    'phonePlannerCloudflareRest.js',
+    'phonePlannerCloudflareWorkflow.js',
     'phonePlannerCore.js',
     'phonePlannerFirebaseConfig.js',
     'phonePlannerFirebaseRest.js',
@@ -22,6 +25,12 @@ const PHONE_PLANNER_STAGING_FILES = Object.freeze([
     'styles.css',
     'cloudflare-sync-config.example.json',
     'firebase-staging-config.example.json'
+])
+
+const CLOUDFLARE_SYNC_STAGING_FILES = Object.freeze([
+    'cloudflareCanonicalRequest.js',
+    'cloudflareSyncConstants.js',
+    'cloudflareSyncFetchClient.js'
 ])
 
 const OPTIONAL_STAGING_CONFIGS = Object.freeze([
@@ -66,13 +75,15 @@ function assertSafeTarget(candidateTarget = targetDir) {
 function copyAllowlistedFile(fileName, options = {}) {
     const fromDir = options.sourceRoot || sourceDir
     const toDir = options.targetRoot || targetDir
+    const targetName = options.targetName || basename(fileName)
     const sourcePath = resolve(fromDir, fileName)
-    const targetPath = resolve(toDir, basename(fileName))
+    const targetPath = resolve(toDir, targetName)
     if (!isWithin(fromDir, sourcePath)) fail(`Refusing to copy outside phone planner source: ${fileName}`)
     if (!isWithin(toDir, targetPath)) fail(`Refusing to write outside phone planner staging artifact: ${fileName}`)
     if (!existsSync(sourcePath) || !statSync(sourcePath).isFile()) {
         fail(`Missing phone planner staging source file: ${fileName}`)
     }
+    mkdirSync(resolve(targetPath, '..'), { recursive: true })
     copyFileSync(sourcePath, targetPath)
 }
 
@@ -112,6 +123,12 @@ function buildPhonePlannerStaging() {
     rmSync(targetDir, { recursive: true, force: true })
     mkdirSync(targetDir, { recursive: true })
     for (const fileName of PHONE_PLANNER_STAGING_FILES) copyAllowlistedFile(fileName)
+    for (const fileName of CLOUDFLARE_SYNC_STAGING_FILES) {
+        copyAllowlistedFile(fileName, {
+            sourceRoot: cloudflareSyncSourceDir,
+            targetName: join('cloudflare-sync', fileName)
+        })
+    }
     copyOptionalStagingConfigs()
     assertSafeArtifactFiles()
     console.log(`Built hosted phone planner staging artifact: ${targetDir}`)
@@ -129,6 +146,7 @@ if (require.main === module) {
 module.exports = {
     FORBIDDEN_ARTIFACT_NAMES,
     FORBIDDEN_ARTIFACT_SEGMENTS,
+    CLOUDFLARE_SYNC_STAGING_FILES,
     OPTIONAL_STAGING_CONFIG,
     OPTIONAL_STAGING_CONFIGS,
     PHONE_PLANNER_STAGING_FILES,

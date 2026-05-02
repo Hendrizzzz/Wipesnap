@@ -457,12 +457,15 @@ async function recordPatchApplyDecision({
         deviceSequence,
         requestedAt: decidedAt
     })
-    state.device = { ...state.device, deviceSequence }
-    await updateLocalSequence(storage, deviceSequence)
+    const effectiveDeviceSequence = Number.isSafeInteger(result?.deviceSequence) && result.deviceSequence >= deviceSequence
+        ? result.deviceSequence
+        : deviceSequence
+    state.device = { ...state.device, deviceSequence: effectiveDeviceSequence }
+    await updateLocalSequence(storage, effectiveDeviceSequence)
     return {
         status: result.status,
         reason: result.reason,
-        deviceSequence
+        deviceSequence: effectiveDeviceSequence
     }
 }
 

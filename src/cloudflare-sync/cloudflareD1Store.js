@@ -116,8 +116,25 @@ export function createCloudflareD1Store({ db } = {}) {
         return results
     }
 
+    async function atomicBatch(statements) {
+        if (typeof database.batch !== 'function') {
+            throw new Error('Cloudflare sync D1 store requires batch transactions for this operation.')
+        }
+        return database.batch(statements)
+    }
+
     function statement(sql, ...params) {
         return database.prepare(sql).bind(...params)
+    }
+
+    function guardExists(sql, ...params) {
+        return statement(
+            `INSERT INTO cloudflare_sync_owners
+             (owner_uid, schema_version, status, active_key_version, created_at, updated_at)
+             SELECT '__approval_guard__', 1, 'invalid', 1, 0, 0
+             WHERE NOT EXISTS (${sql})`,
+            ...params
+        )
     }
 
     async function createOwner(ownerUid, now) {
@@ -372,48 +389,70 @@ export function createCloudflareD1Store({ db } = {}) {
                 fail(403, 'wrong-device', 'Cloudflare sync key grant recipient does not match enrollment.')
             }
             const device = { ...decode(request.device_json, {}), status: 'active', updatedAt: now }
-            const activated = await first(
-                `UPDATE cloudflare_sync_devices
-                 SET status = 'active', updated_at = ?
-                 WHERE owner_uid = ? AND device_id = ? AND status = 'pending' AND revoked_at IS NULL
-                 RETURNING device_id`,
-                now,
-                ownerUid,
-                request.device_id
-            )
-            if (!activated) fail(409, 'device-state-conflict', 'Cloudflare sync enrollment device state changed before approval.')
-            const grantInserted = await run(
-                `INSERT INTO cloudflare_sync_key_grants
-                 (owner_uid, grant_id, recipient_device_id, created_by_device_id, key_version, wrap_alg,
-                  wrapped_key_ciphertext, wrapped_key_hash, grant_json, created_at, revoked_at, revoked_by_device_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(owner_uid, grant_id) DO NOTHING`,
-                ownerUid,
-                keyGrant.grantId,
-                keyGrant.recipientDeviceId,
-                desktopDeviceId,
-                keyGrant.keyVersion,
-                keyGrant.wrapAlg,
-                keyGrant.wrappedKeyCiphertext,
-                keyGrant.wrappedKeyHash,
-                encode(keyGrant),
-                keyGrant.createdAt,
-                keyGrant.revokedAt,
-                keyGrant.revokedByDeviceId
-            )
-            if (changedRows(grantInserted) !== 1) fail(409, 'key-grant-exists', 'Cloudflare sync key grant already exists.')
-            const approved = await first(
-                `UPDATE cloudflare_sync_enrollment_requests
-                 SET status = 'approved', approved_at = ?, approved_by_device_id = ?, key_grant_id = ?
-                 WHERE owner_uid = ? AND request_id = ? AND status = 'pending'
-                 RETURNING request_id`,
-                now,
-                desktopDeviceId,
-                keyGrant.grantId,
-                ownerUid,
-                requestId
-            )
-            if (!approved) fail(409, 'enrollment-state-conflict', 'Cloudflare sync enrollment state changed before approval.')
+            try {
+                await atomicBatch([
+                    statement(
+                        `UPDATE cloudflare_sync_devices
+                         SET status = 'active', updated_at = ?
+                         WHERE owner_uid = ? AND device_id = ? AND status = 'pending' AND revoked_at IS NULL`,
+                        now,
+                        ownerUid,
+                        request.device_id
+                    ),
+                    guardExists(
+                        `SELECT 1 FROM cloudflare_sync_devices
+                         WHERE owner_uid = ? AND device_id = ? AND status = 'active' AND revoked_at IS NULL`,
+                        ownerUid,
+                        request.device_id
+                    ),
+                    statement(
+                        `INSERT INTO cloudflare_sync_key_grants
+                         (owner_uid, grant_id, recipient_device_id, created_by_device_id, key_version, wrap_alg,
+                          wrapped_key_ciphertext, wrapped_key_hash, grant_json, created_at, revoked_at, revoked_by_device_id)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                        ownerUid,
+                        keyGrant.grantId,
+                        keyGrant.recipientDeviceId,
+                        desktopDeviceId,
+                        keyGrant.keyVersion,
+                        keyGrant.wrapAlg,
+                        keyGrant.wrappedKeyCiphertext,
+                        keyGrant.wrappedKeyHash,
+                        encode(keyGrant),
+                        keyGrant.createdAt,
+                        keyGrant.revokedAt,
+                        keyGrant.revokedByDeviceId
+                    ),
+                    guardExists(
+                        `SELECT 1 FROM cloudflare_sync_key_grants
+                         WHERE owner_uid = ? AND grant_id = ? AND recipient_device_id = ?`,
+                        ownerUid,
+                        keyGrant.grantId,
+                        keyGrant.recipientDeviceId
+                    ),
+                    statement(
+                        `UPDATE cloudflare_sync_enrollment_requests
+                         SET status = 'approved', approved_at = ?, approved_by_device_id = ?, key_grant_id = ?
+                         WHERE owner_uid = ? AND request_id = ? AND status = 'pending'`,
+                        now,
+                        desktopDeviceId,
+                        keyGrant.grantId,
+                        ownerUid,
+                        requestId
+                    ),
+                    guardExists(
+                        `SELECT 1 FROM cloudflare_sync_enrollment_requests
+                         WHERE owner_uid = ? AND request_id = ? AND status = 'approved'
+                           AND approved_by_device_id = ? AND key_grant_id = ?`,
+                        ownerUid,
+                        requestId,
+                        desktopDeviceId,
+                        keyGrant.grantId
+                    )
+                ])
+            } catch (_) {
+                fail(409, 'approval-conflict', 'Cloudflare sync enrollment approval did not commit atomically.')
+            }
             return { device: clone(device), keyGrant: clone(keyGrant) }
         },
 
@@ -559,6 +598,24 @@ export function createCloudflareD1Store({ db } = {}) {
                 CLOUDFLARE_SYNC_LIMITS.maxPendingPatchesPerOwner
             )
             return rows.map(rowToPatch)
+        },
+
+        async getPatch(ownerUid, revisionId, status = null) {
+            const row = status
+                ? await first(
+                    `SELECT * FROM cloudflare_sync_patches
+                     WHERE owner_uid = ? AND revision_id = ? AND status = ?`,
+                    ownerUid,
+                    revisionId,
+                    status
+                )
+                : await first(
+                    `SELECT * FROM cloudflare_sync_patches
+                     WHERE owner_uid = ? AND revision_id = ?`,
+                    ownerUid,
+                    revisionId
+                )
+            return rowToPatch(row)
         },
 
         async recordPatchDecision({ ownerUid, decision, now }) {

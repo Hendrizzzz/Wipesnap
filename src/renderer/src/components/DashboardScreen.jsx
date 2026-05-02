@@ -542,6 +542,11 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
         () => window.wipesnap.cloudSync.applyTrustedPatches({})
     )
 
+    const bootstrapCloudDesktop = () => runCloudSyncAction(
+        'bootstrap-cloudflare-desktop',
+        () => window.wipesnap.cloudSync.bootstrapDesktopDevice()
+    )
+
     const listCloudDeviceEnrollments = () => runCloudSyncAction(
         'list-pending-device-enrollments',
         async () => {
@@ -1329,6 +1334,13 @@ export default function DashboardScreen({ driveInfo, workspace, vaultMeta, onSav
                                 onChange={event => setCloudEnrollmentRequestId(event.target.value)}
                             />
                             <div className="grid grid-cols-2 gap-2 mt-2">
+                                <button
+                                    className="btn-secondary text-[11px] py-2 px-2"
+                                    disabled={!!cloudSyncBusyAction}
+                                    onClick={bootstrapCloudDesktop}
+                                >
+                                    {cloudSyncBusyAction === 'bootstrap-cloudflare-desktop' ? 'Preparing...' : 'Prepare Cloud'}
+                                </button>
                                 <button
                                     className="btn-secondary text-[11px] py-2 px-2"
                                     disabled={!!cloudSyncBusyAction}
